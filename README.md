@@ -1,6 +1,6 @@
 # 🇧🇷 ptbrr: Torznab pt-BR Reverse Proxy Middleware
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/lucasfariamm/ptbrr)](https://goreportcard.com/report/github.com/lucasfariamm/ptbrr)
+[![Go Report Card](https://goreportcard.com/badge/github.com/zwlucas/ptbrr)](https://goreportcard.com/report/github.com/zwlucas/ptbrr)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **ptbrr** é um middleware de proxy reverso ultraleve e de alta performance desenvolvido em Go (exclusivamente com a biblioteca padrão). Ele intercepta as requisições Torznab enviadas pelo **Radarr** em direção ao **Prowlarr**, identifica o identificador `tmdbid` do filme, traduz em tempo real o termo de busca em inglês (`q`) para o título correspondente em português brasileiro (**pt-BR**) via API do TMDB, e repassa a requisição com o título traduzido.
@@ -81,7 +81,7 @@ Identifique a arquitetura do seu processador (`x86_64` para computadores comuns 
 #### Opção A: Usando `curl` (Linux amd64 - padrão Proxmox x86_64)
 ```bash
 sudo curl -sSL -o /usr/local/bin/ptbrr \
-  https://github.com/lucasfariamm/ptbrr/releases/latest/download/ptbrr-linux-amd64
+  https://github.com/zwlucas/ptbrr/releases/latest/download/ptbrr-linux-amd64
 
 sudo chmod +x /usr/local/bin/ptbrr
 ```
@@ -89,7 +89,7 @@ sudo chmod +x /usr/local/bin/ptbrr
 #### Opção B: Usando `wget` (Linux arm64 / ARM)
 ```bash
 sudo wget -O /usr/local/bin/ptbrr \
-  https://github.com/lucasfariamm/ptbrr/releases/latest/download/ptbrr-linux-arm64
+  https://github.com/zwlucas/ptbrr/releases/latest/download/ptbrr-linux-arm64
 
 sudo chmod +x /usr/local/bin/ptbrr
 ```
@@ -135,7 +135,7 @@ Cole a configuração:
 ```ini
 [Unit]
 Description=ptbrr - Torznab pt-BR Translation Reverse Proxy
-Documentation=https://github.com/lucasfariamm/ptbrr
+Documentation=https://github.com/zwlucas/ptbrr
 After=network.target network-online.target
 Wants=network-online.target
 
@@ -222,7 +222,7 @@ Para desenvolvedores que desejam compilar diretamente a partir do código-fonte:
 
 ```bash
 # Clonar o repositório
-git clone https://github.com/lucasfariamm/ptbrr.git
+git clone https://github.com/zwlucas/ptbrr.git
 cd ptbrr
 
 # Executar suíte completa de testes unitários e de integração
