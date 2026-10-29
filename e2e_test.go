@@ -1,0 +1,153 @@
+package main_test
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"ptbrr/internal/proxy"
+	"ptbrr/internal/tmdb"
+)
+
+func TestEndToEndTorznabTranslationFlow(t *testing.T) {
+	var tmdbCallCount int32
+	var prowlarrCallCount int32
+	var lastProwlarrQuery url.Values
+
+	// 1. Mock TMDB API Server
+	mockTMDB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&tmdbCallCount, 1)
+
+		if r.URL.Path != "/movie/603" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Query().Get("api_key") != "my-tmdb-key" {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Query().Get("language") != "pt-BR" {
+			http.Error(w, "Bad Language", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"id":             603,
+			"title":          "Matrix",
+			"original_title": "The Matrix",
+		})
+	}))
+	defer mockTMDB.Close()
+
+	// 2. Mock Upstream Prowlarr Server
+	torznabXML := `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <title>Prowlarr Indexer</title>
+    <item>
+      <title>Matrix (1999) 2160p Dual Audio Remux</title>
+      <size>45000000000</size>
+    </item>
+  </channel>
+</rss>`
+
+	mockProwlarr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&prowlarrCallCount, 1)
+		lastProwlarrQuery = r.URL.Query()
+
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(torznabXML))
+	}))
+	defer mockProwlarr.Close()
+
+	prowlarrURL, err := url.Parse(mockProwlarr.URL)
+	if err != nil {
+		t.Fatalf("failed to parse mock prowlarr url: %v", err)
+	}
+
+	// 3. Initialize Proxy with TMDB client
+	tmdbClient := tmdb.NewClient("my-tmdb-key", mockTMDB.URL, 5*time.Second, 1*time.Hour)
+	proxyHandler := proxy.NewProxy(prowlarrURL, tmdbClient, nil)
+
+	proxyServer := httptest.NewServer(proxyHandler)
+	defer proxyServer.Close()
+
+	// 4. Radarr performs Torznab search with English query & tmdbid
+	// GET /api/v1/search?q=The+Matrix&tmdbid=603&apikey=secret-prowlarr-token
+	radarrURL := fmt.Sprintf("%s/api/v1/search?q=The+Matrix&tmdbid=603&apikey=secret-prowlarr-token", proxyServer.URL)
+
+	resp, err := http.Get(radarrURL)
+	if err != nil {
+		t.Fatalf("Radarr search failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read body: %v", err)
+	}
+
+	// 5. Verify returned XML body
+	if string(body) != torznabXML {
+		t.Errorf("expected XML response %q, got %q", torznabXML, string(body))
+	}
+
+	// 6. Verify Prowlarr received translated "Matrix" instead of "The Matrix"
+	if lastProwlarrQuery.Get("q") != "Matrix" {
+		t.Errorf("expected translated query q='Matrix', got '%s'", lastProwlarrQuery.Get("q"))
+	}
+	if lastProwlarrQuery.Get("tmdbid") != "603" {
+		t.Errorf("expected tmdbid=603 preserved, got '%s'", lastProwlarrQuery.Get("tmdbid"))
+	}
+	if lastProwlarrQuery.Get("apikey") != "secret-prowlarr-token" {
+		t.Errorf("expected apikey preserved, got '%s'", lastProwlarrQuery.Get("apikey"))
+	}
+
+	if atomic.LoadInt32(&tmdbCallCount) != 1 {
+		t.Errorf("expected 1 TMDB call, got %d", atomic.LoadInt32(&tmdbCallCount))
+	}
+	if atomic.LoadInt32(&prowlarrCallCount) != 1 {
+		t.Errorf("expected 1 Prowlarr call, got %d", atomic.LoadInt32(&prowlarrCallCount))
+	}
+
+	// 7. Verify Cache on 2nd identical request: TMDB should NOT be called again
+	resp2, err := http.Get(radarrURL)
+	if err != nil {
+		t.Fatalf("2nd Radarr search failed: %v", err)
+	}
+	resp2.Body.Close()
+
+	if atomic.LoadInt32(&tmdbCallCount) != 1 {
+		t.Errorf("expected TMDB call count to remain 1 due to cache, got %d", atomic.LoadInt32(&tmdbCallCount))
+	}
+	if atomic.LoadInt32(&prowlarrCallCount) != 2 {
+		t.Errorf("expected Prowlarr call count to be 2, got %d", atomic.LoadInt32(&prowlarrCallCount))
+	}
+
+	// 8. Test Torznab caps request (no tmdbid): TMDB should NOT be called
+	capsURL := fmt.Sprintf("%s/api?t=caps&apikey=secret-prowlarr-token", proxyServer.URL)
+	resp3, err := http.Get(capsURL)
+	if err != nil {
+		t.Fatalf("Caps request failed: %v", err)
+	}
+	resp3.Body.Close()
+
+	if atomic.LoadInt32(&tmdbCallCount) != 1 {
+		t.Errorf("TMDB should not be called for requests without tmdbid, got %d", atomic.LoadInt32(&tmdbCallCount))
+	}
+	if atomic.LoadInt32(&prowlarrCallCount) != 3 {
+		t.Errorf("expected Prowlarr call count to be 3, got %d", atomic.LoadInt32(&prowlarrCallCount))
+	}
+}
