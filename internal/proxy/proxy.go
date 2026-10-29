@@ -14,6 +14,7 @@ import (
 // TitleFetcher is an abstraction for querying localized movie titles.
 type TitleFetcher interface {
 	GetMovieTitle(ctx context.Context, tmdbID string) (string, error)
+	TranslateByQuery(ctx context.Context, query string) (string, error)
 }
 
 // Proxy is a Torznab reverse proxy middleware that translates English movie search
@@ -88,20 +89,31 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 2. Parse query parameters
 	queryParams := r.URL.Query()
 	tmdbID := strings.TrimSpace(queryParams.Get("tmdbid"))
+	rawQ := strings.TrimSpace(queryParams.Get("q"))
+	tType := strings.TrimSpace(queryParams.Get("t"))
 
-	// 3. Intercept tmdbid if present
-	if tmdbID != "" && p.titleFetcher != nil {
-		originalQuery := queryParams.Get("q")
-
-		translatedTitle, err := p.titleFetcher.GetMovieTitle(r.Context(), tmdbID)
-		if err != nil {
-			p.logger.Printf("[TMDB WARNING] tmdbid=%s lookup failed: %v (keeping original q=%q)", tmdbID, err, originalQuery)
-		} else if translatedTitle != "" {
-			// Replace or set the 'q' parameter with pt-BR title
-			queryParams.Set("q", translatedTitle)
-			r.URL.RawQuery = queryParams.Encode()
-
-			p.logger.Printf("[TMDB TRANSLATE] tmdbid=%s: %q -> %q", tmdbID, originalQuery, translatedTitle)
+	// 3. Intercept & translate
+	if p.titleFetcher != nil {
+		if tmdbID != "" {
+			// Scenario A: tmdbid is explicitly present
+			translatedTitle, err := p.titleFetcher.GetMovieTitle(r.Context(), tmdbID)
+			if err != nil {
+				p.logger.Printf("[TMDB WARNING] tmdbid=%s lookup failed: %v (keeping original q=%q)", tmdbID, err, rawQ)
+			} else if translatedTitle != "" {
+				queryParams.Set("q", translatedTitle)
+				r.URL.RawQuery = queryParams.Encode()
+				p.logger.Printf("[TMDB TRANSLATE (by ID)] tmdbid=%s: %q -> %q", tmdbID, rawQ, translatedTitle)
+			}
+		} else if rawQ != "" && (tType == "search" || tType == "movie" || tType == "") {
+			// Scenario B: Public tracker search with only 'q' (e.g. t=search&q=Pirates+of+Silicon+Valley+1999)
+			translatedTitle, err := p.titleFetcher.TranslateByQuery(r.Context(), rawQ)
+			if err != nil {
+				p.logger.Printf("[TMDB WARNING] text search translation for %q failed: %v (keeping original)", rawQ, err)
+			} else if translatedTitle != "" {
+				queryParams.Set("q", translatedTitle)
+				r.URL.RawQuery = queryParams.Encode()
+				p.logger.Printf("[TMDB TRANSLATE (by Search)] %q -> %q", rawQ, translatedTitle)
+			}
 		}
 	}
 

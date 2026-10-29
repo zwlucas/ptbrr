@@ -12,8 +12,9 @@ import (
 )
 
 type mockTitleFetcher struct {
-	titles map[string]string
-	err    error
+	titles  map[string]string
+	queries map[string]string
+	err     error
 }
 
 func (m *mockTitleFetcher) GetMovieTitle(ctx context.Context, tmdbID string) (string, error) {
@@ -24,6 +25,16 @@ func (m *mockTitleFetcher) GetMovieTitle(ctx context.Context, tmdbID string) (st
 		return title, nil
 	}
 	return "", fmt.Errorf("tmdbid %s not found in mock", tmdbID)
+}
+
+func (m *mockTitleFetcher) TranslateByQuery(ctx context.Context, query string) (string, error) {
+	if m.err != nil {
+		return "", m.err
+	}
+	if title, ok := m.queries[query]; ok {
+		return title, nil
+	}
+	return "", fmt.Errorf("query %q not found in mock", query)
 }
 
 func TestProxy_TranslationSuccess(t *testing.T) {
@@ -212,5 +223,50 @@ func TestProxy_Healthz(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "OK" {
 		t.Errorf("expected body 'OK', got '%s'", string(body))
+	}
+}
+
+func TestProxy_PublicTrackerTextSearchTranslation(t *testing.T) {
+	var receivedQuery url.Values
+
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedQuery = r.URL.Query()
+		w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<rss></rss>"))
+	}))
+	defer upstreamServer.Close()
+
+	upstreamURL, _ := url.Parse(upstreamServer.URL)
+	fetcher := &mockTitleFetcher{
+		queries: map[string]string{
+			"Pirates of Silicon Valley 1999": "Piratas do Vale do Silício 1999",
+		},
+	}
+
+	proxyHandler := NewProxy(upstreamURL, fetcher, nil)
+	proxyServer := httptest.NewServer(proxyHandler)
+	defer proxyServer.Close()
+
+	// Intercepted Radarr public tracker search:
+	// /1/api?t=search&cat=2000&extended=1&apikey=CHAVE&offset=0&limit=100&q=Pirates%20of%20Silicon%20Valley%201999
+	reqURL := fmt.Sprintf("%s/1/api?t=search&cat=2000&extended=1&apikey=CHAVE&offset=0&limit=100&q=Pirates%%20of%%20Silicon%%20Valley%%201999", proxyServer.URL)
+	resp, err := http.Get(reqURL)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK, got %d", resp.StatusCode)
+	}
+	if receivedQuery.Get("q") != "Piratas do Vale do Silício 1999" {
+		t.Errorf("expected translated query 'Piratas do Vale do Silício 1999', got %q", receivedQuery.Get("q"))
+	}
+	if receivedQuery.Get("t") != "search" {
+		t.Errorf("expected t=search preserved, got %q", receivedQuery.Get("t"))
+	}
+	if receivedQuery.Get("apikey") != "CHAVE" {
+		t.Errorf("expected apikey preserved, got %q", receivedQuery.Get("apikey"))
 	}
 }

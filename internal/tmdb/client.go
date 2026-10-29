@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,9 +20,16 @@ var (
 	ErrMissingAPIKey = errors.New("TMDB API key is not configured")
 	// ErrEmptyTMDBID is returned when the provided tmdbid parameter is empty.
 	ErrEmptyTMDBID = errors.New("tmdbid cannot be empty")
+	// ErrEmptyQuery is returned when the search query is empty.
+	ErrEmptyQuery = errors.New("query cannot be empty")
 	// ErrTitleNotFound is returned when TMDB returns a 200 OK but the title field is empty.
 	ErrTitleNotFound = errors.New("title not found in TMDB response")
+	// ErrNoSearchResults is returned when TMDB search/movie returns zero results.
+	ErrNoSearchResults = errors.New("no movie results found in TMDB")
 )
+
+// trailingYearRegex matches a 4-digit release year at the end of the query (e.g., " 1999" or " (1999)").
+var trailingYearRegex = regexp.MustCompile(`(?:\s+|\()(\b(?:19|20)\d{2}\b)\)?\s*$`)
 
 type cacheEntry struct {
 	title     string
@@ -66,6 +75,152 @@ type movieResponse struct {
 	ID            int64  `json:"id"`
 	Title         string `json:"title"`
 	OriginalTitle string `json:"original_title"`
+}
+
+// searchMovieResponse matches the TMDB /search/movie JSON response.
+type searchMovieResponse struct {
+	Page    int `json:"page"`
+	Results []struct {
+		ID            int64  `json:"id"`
+		Title         string `json:"title"`
+		OriginalTitle string `json:"original_title"`
+		ReleaseDate   string `json:"release_date"`
+	} `json:"results"`
+	TotalResults int `json:"total_results"`
+}
+
+// extractYearAndCleanTitle extracts the 4-digit year at the end of a title query if present.
+func extractYearAndCleanTitle(rawQuery string) (cleanTitle, year string) {
+	trimmed := strings.TrimSpace(rawQuery)
+	matches := trailingYearRegex.FindStringSubmatch(trimmed)
+	if len(matches) == 2 {
+		year = matches[1]
+		clean := strings.TrimSpace(trailingYearRegex.ReplaceAllString(trimmed, ""))
+		if clean != "" {
+			return clean, year
+		}
+	}
+	return trimmed, ""
+}
+
+// TranslateByQuery performs text-based reverse search for Torznab indexers that don't provide tmdbid.
+// It searches TMDB for the movie, captures the first ID, fetches the localized pt-BR title,
+// and appends the original year if present.
+func (c *Client) TranslateByQuery(ctx context.Context, rawQuery string) (string, error) {
+	rawQuery = strings.TrimSpace(rawQuery)
+	if rawQuery == "" {
+		return "", ErrEmptyQuery
+	}
+
+	cacheKey := "q:" + strings.ToLower(rawQuery)
+	if cachedTitle, found := c.getFromCache(cacheKey); found {
+		return cachedTitle, nil
+	}
+
+	if c.apiKey == "" {
+		return "", ErrMissingAPIKey
+	}
+
+	cleanTitle, year := extractYearAndCleanTitle(rawQuery)
+
+	// Step 1: Query TMDB Search API: /search/movie?api_key={key}&query={cleanTitle}&year={year}
+	searchURL := fmt.Sprintf("%s/search/movie?api_key=%s&query=%s",
+		c.baseURL,
+		url.QueryEscape(c.apiKey),
+		url.QueryEscape(cleanTitle),
+	)
+	if year != "" {
+		searchURL += fmt.Sprintf("&year=%s", url.QueryEscape(year))
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, searchURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create TMDB search request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "ptbrr-proxy/1.0")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("TMDB search request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodySnippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", fmt.Errorf("TMDB search returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(bodySnippet)))
+	}
+
+	var searchResp searchMovieResponse
+	if err := json.NewDecoder(resp.Body).Decode(&searchResp); err != nil {
+		return "", fmt.Errorf("failed to decode TMDB search JSON: %w", err)
+	}
+
+	if len(searchResp.Results) == 0 {
+		// If year search gave 0 results, retry without year parameter before giving up
+		if year != "" {
+			return c.searchWithoutYear(ctx, cleanTitle, rawQuery, year)
+		}
+		return "", ErrNoSearchResults
+	}
+
+	// Step 2: Grab the first result's ID and fetch localized pt-BR details
+	firstMovieID := strconv.FormatInt(searchResp.Results[0].ID, 10)
+	ptBRTitle, err := c.GetMovieTitle(ctx, firstMovieID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get pt-BR details for movie ID %s: %w", firstMovieID, err)
+	}
+
+	// Step 3: Append original year if present
+	finalTitle := ptBRTitle
+	if year != "" {
+		finalTitle = fmt.Sprintf("%s %s", ptBRTitle, year)
+	}
+
+	// Cache the query mapping
+	c.setInCache(cacheKey, finalTitle)
+
+	return finalTitle, nil
+}
+
+func (c *Client) searchWithoutYear(ctx context.Context, cleanTitle, rawQuery, year string) (string, error) {
+	searchURL := fmt.Sprintf("%s/search/movie?api_key=%s&query=%s",
+		c.baseURL,
+		url.QueryEscape(c.apiKey),
+		url.QueryEscape(cleanTitle),
+	)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, searchURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "ptbrr-proxy/1.0")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", ErrNoSearchResults
+	}
+
+	var searchResp searchMovieResponse
+	if err := json.NewDecoder(resp.Body).Decode(&searchResp); err != nil || len(searchResp.Results) == 0 {
+		return "", ErrNoSearchResults
+	}
+
+	firstMovieID := strconv.FormatInt(searchResp.Results[0].ID, 10)
+	ptBRTitle, err := c.GetMovieTitle(ctx, firstMovieID)
+	if err != nil {
+		return "", err
+	}
+
+	finalTitle := fmt.Sprintf("%s %s", ptBRTitle, year)
+	c.setInCache("q:"+strings.ToLower(rawQuery), finalTitle)
+	return finalTitle, nil
 }
 
 // GetMovieTitle fetches the Brazilian Portuguese (pt-BR) localized title for a given tmdbid.
@@ -131,11 +286,11 @@ func (c *Client) GetMovieTitle(ctx context.Context, tmdbID string) (string, erro
 	return title, nil
 }
 
-func (c *Client) getFromCache(tmdbID string) (string, bool) {
+func (c *Client) getFromCache(key string) (string, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	entry, ok := c.cache[tmdbID]
+	entry, ok := c.cache[key]
 	if !ok {
 		return "", false
 	}
@@ -147,11 +302,11 @@ func (c *Client) getFromCache(tmdbID string) (string, bool) {
 	return entry.title, true
 }
 
-func (c *Client) setInCache(tmdbID, title string) {
+func (c *Client) setInCache(key, title string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.cache[tmdbID] = cacheEntry{
+	c.cache[key] = cacheEntry{
 		title:     title,
 		expiresAt: time.Now().Add(c.cacheTTL),
 	}

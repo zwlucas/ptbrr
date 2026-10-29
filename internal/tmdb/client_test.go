@@ -167,3 +167,92 @@ func TestPurgeExpired(t *testing.T) {
 		t.Errorf("expected cache count 0, got %d", client.CacheCount())
 	}
 }
+
+func TestTranslateByQuery_Success(t *testing.T) {
+	var searchCalls int32
+	var detailCalls int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.URL.Path == "/search/movie" {
+			atomic.AddInt32(&searchCalls, 1)
+			if r.URL.Query().Get("query") != "Pirates of Silicon Valley" {
+				t.Errorf("expected clean query 'Pirates of Silicon Valley', got %q", r.URL.Query().Get("query"))
+			}
+			if r.URL.Query().Get("year") != "1999" {
+				t.Errorf("expected year 1999, got %q", r.URL.Query().Get("year"))
+			}
+
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"results": []map[string]interface{}{
+					{"id": 12345, "title": "Pirates of Silicon Valley"},
+				},
+			})
+			return
+		}
+
+		if r.URL.Path == "/movie/12345" {
+			atomic.AddInt32(&detailCalls, 1)
+			if r.URL.Query().Get("language") != "pt-BR" {
+				t.Errorf("expected language pt-BR, got %s", r.URL.Query().Get("language"))
+			}
+
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":    12345,
+				"title": "Piratas do Vale do Silício",
+			})
+			return
+		}
+
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	client := NewClient("test-key", server.URL, 5*time.Second, 1*time.Hour)
+
+	// First query
+	res, err := client.TranslateByQuery(context.Background(), "Pirates of Silicon Valley 1999")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res != "Piratas do Vale do Silício 1999" {
+		t.Errorf("expected 'Piratas do Vale do Silício 1999', got %q", res)
+	}
+	if atomic.LoadInt32(&searchCalls) != 1 || atomic.LoadInt32(&detailCalls) != 1 {
+		t.Errorf("expected 1 search and 1 detail call, got %d and %d", searchCalls, detailCalls)
+	}
+
+	// Second query should hit cache
+	res2, err := client.TranslateByQuery(context.Background(), "Pirates of Silicon Valley 1999")
+	if err != nil {
+		t.Fatalf("unexpected error on cached query: %v", err)
+	}
+	if res2 != "Piratas do Vale do Silício 1999" {
+		t.Errorf("expected cached result 'Piratas do Vale do Silício 1999', got %q", res2)
+	}
+	if atomic.LoadInt32(&searchCalls) != 1 || atomic.LoadInt32(&detailCalls) != 1 {
+		t.Errorf("cache failed, searchCalls=%d, detailCalls=%d", searchCalls, detailCalls)
+	}
+}
+
+func TestExtractYearAndCleanTitle(t *testing.T) {
+	tests := []struct {
+		input      string
+		expectedC  string
+		expectedYr string
+	}{
+		{"Pirates of Silicon Valley 1999", "Pirates of Silicon Valley", "1999"},
+		{"The Matrix (1999)", "The Matrix", "1999"},
+		{"The Dark Knight", "The Dark Knight", ""},
+		{"2012", "2012", ""},
+		{"Blade Runner 2049", "Blade Runner", "2049"},
+	}
+
+	for _, tt := range tests {
+		clean, yr := extractYearAndCleanTitle(tt.input)
+		if clean != tt.expectedC || yr != tt.expectedYr {
+			t.Errorf("extractYearAndCleanTitle(%q) = (%q, %q), want (%q, %q)", tt.input, clean, yr, tt.expectedC, tt.expectedYr)
+		}
+	}
+}

@@ -24,6 +24,16 @@ func TestEndToEndTorznabTranslationFlow(t *testing.T) {
 	mockTMDB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&tmdbCallCount, 1)
 
+		if r.URL.Path == "/search/movie" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"results": []map[string]interface{}{
+					{"id": 603, "title": "The Matrix"},
+				},
+			})
+			return
+		}
+
 		if r.URL.Path != "/movie/603" {
 			http.NotFound(w, r)
 			return
@@ -149,5 +159,21 @@ func TestEndToEndTorznabTranslationFlow(t *testing.T) {
 	}
 	if atomic.LoadInt32(&prowlarrCallCount) != 3 {
 		t.Errorf("expected Prowlarr call count to be 3, got %d", atomic.LoadInt32(&prowlarrCallCount))
+	}
+
+	// 9. Public tracker search without tmdbid (exact user scenario):
+	// /1/api?t=search&cat=2000&extended=1&apikey=secret-prowlarr-token&offset=0&limit=100&q=The+Matrix+1999
+	publicTrackerURL := fmt.Sprintf("%s/1/api?t=search&cat=2000&extended=1&apikey=secret-prowlarr-token&offset=0&limit=100&q=The+Matrix+1999", proxyServer.URL)
+	resp4, err := http.Get(publicTrackerURL)
+	if err != nil {
+		t.Fatalf("Public tracker search failed: %v", err)
+	}
+	resp4.Body.Close()
+
+	if resp4.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK, got %d", resp4.StatusCode)
+	}
+	if lastProwlarrQuery.Get("q") != "Matrix 1999" {
+		t.Errorf("expected public tracker search 'q' to be translated to 'Matrix 1999', got %q", lastProwlarrQuery.Get("q"))
 	}
 }
