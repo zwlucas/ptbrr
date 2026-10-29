@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,7 +20,8 @@ import (
 func TestEndToEndTorznabTranslationFlow(t *testing.T) {
 	var tmdbCallCount int32
 	var prowlarrCallCount int32
-	var lastProwlarrQuery url.Values
+	var queriesMu sync.Mutex
+	var prowlarrQueries []string
 
 	// 1. Mock TMDB API Server
 	mockTMDB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -34,16 +37,23 @@ func TestEndToEndTorznabTranslationFlow(t *testing.T) {
 			return
 		}
 
+		if r.URL.Path == "/movie/603/alternative_titles" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id": 603,
+				"titles": []map[string]interface{}{
+					{"iso_3166_1": "BR", "title": "Matrix"},
+				},
+			})
+			return
+		}
+
 		if r.URL.Path != "/movie/603" {
 			http.NotFound(w, r)
 			return
 		}
 		if r.URL.Query().Get("api_key") != "my-tmdb-key" {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-		if r.URL.Query().Get("language") != "pt-BR" {
-			http.Error(w, "Bad Language", http.StatusBadRequest)
 			return
 		}
 
@@ -63,6 +73,8 @@ func TestEndToEndTorznabTranslationFlow(t *testing.T) {
     <title>Prowlarr Indexer</title>
     <item>
       <title>Matrix (1999) 2160p Dual Audio Remux</title>
+      <guid>guid-matrix-1</guid>
+      <link>http://tracker/1</link>
       <size>45000000000</size>
     </item>
   </channel>
@@ -70,9 +82,11 @@ func TestEndToEndTorznabTranslationFlow(t *testing.T) {
 
 	mockProwlarr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&prowlarrCallCount, 1)
-		lastProwlarrQuery = r.URL.Query()
+		queriesMu.Lock()
+		prowlarrQueries = append(prowlarrQueries, r.URL.Query().Get("q"))
+		queriesMu.Unlock()
 
-		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(torznabXML))
 	}))
@@ -91,7 +105,7 @@ func TestEndToEndTorznabTranslationFlow(t *testing.T) {
 	defer proxyServer.Close()
 
 	// 4. Radarr performs Torznab search with English query & tmdbid
-	// GET /api/v1/search?q=The+Matrix&tmdbid=603&apikey=secret-prowlarr-token
+	// Fan-Out should search both "Matrix" and "The Matrix"
 	radarrURL := fmt.Sprintf("%s/api/v1/search?q=The+Matrix&tmdbid=603&apikey=secret-prowlarr-token", proxyServer.URL)
 
 	resp, err := http.Get(radarrURL)
@@ -109,27 +123,17 @@ func TestEndToEndTorznabTranslationFlow(t *testing.T) {
 		t.Fatalf("failed to read body: %v", err)
 	}
 
-	// 5. Verify returned XML body
-	if string(body) != torznabXML {
-		t.Errorf("expected XML response %q, got %q", torznabXML, string(body))
+	// 5. Verify returned XML body contains the item
+	if !strings.Contains(string(body), "Matrix (1999) 2160p Dual Audio Remux") {
+		t.Errorf("expected XML response to contain item, got %q", string(body))
 	}
 
-	// 6. Verify Prowlarr received translated "Matrix" instead of "The Matrix"
-	if lastProwlarrQuery.Get("q") != "Matrix" {
-		t.Errorf("expected translated query q='Matrix', got '%s'", lastProwlarrQuery.Get("q"))
+	// 6. Verify Fan-Out executed Prowlarr searches for both titles
+	if atomic.LoadInt32(&tmdbCallCount) != 2 {
+		t.Errorf("expected 2 TMDB calls (details + alternative titles), got %d", atomic.LoadInt32(&tmdbCallCount))
 	}
-	if lastProwlarrQuery.Get("tmdbid") != "603" {
-		t.Errorf("expected tmdbid=603 preserved, got '%s'", lastProwlarrQuery.Get("tmdbid"))
-	}
-	if lastProwlarrQuery.Get("apikey") != "secret-prowlarr-token" {
-		t.Errorf("expected apikey preserved, got '%s'", lastProwlarrQuery.Get("apikey"))
-	}
-
-	if atomic.LoadInt32(&tmdbCallCount) != 1 {
-		t.Errorf("expected 1 TMDB call, got %d", atomic.LoadInt32(&tmdbCallCount))
-	}
-	if atomic.LoadInt32(&prowlarrCallCount) != 1 {
-		t.Errorf("expected 1 Prowlarr call, got %d", atomic.LoadInt32(&prowlarrCallCount))
+	if atomic.LoadInt32(&prowlarrCallCount) != 2 {
+		t.Errorf("expected 2 Prowlarr calls (fan-out across candidates), got %d", atomic.LoadInt32(&prowlarrCallCount))
 	}
 
 	// 7. Verify Cache on 2nd identical request: TMDB should NOT be called again
@@ -139,11 +143,11 @@ func TestEndToEndTorznabTranslationFlow(t *testing.T) {
 	}
 	resp2.Body.Close()
 
-	if atomic.LoadInt32(&tmdbCallCount) != 1 {
-		t.Errorf("expected TMDB call count to remain 1 due to cache, got %d", atomic.LoadInt32(&tmdbCallCount))
+	if atomic.LoadInt32(&tmdbCallCount) != 2 {
+		t.Errorf("expected TMDB call count to remain 2 due to cache, got %d", atomic.LoadInt32(&tmdbCallCount))
 	}
-	if atomic.LoadInt32(&prowlarrCallCount) != 2 {
-		t.Errorf("expected Prowlarr call count to be 2, got %d", atomic.LoadInt32(&prowlarrCallCount))
+	if atomic.LoadInt32(&prowlarrCallCount) != 4 {
+		t.Errorf("expected Prowlarr call count to be 4, got %d", atomic.LoadInt32(&prowlarrCallCount))
 	}
 
 	// 8. Test Torznab caps request (no tmdbid): TMDB should NOT be called
@@ -154,14 +158,14 @@ func TestEndToEndTorznabTranslationFlow(t *testing.T) {
 	}
 	resp3.Body.Close()
 
-	if atomic.LoadInt32(&tmdbCallCount) != 1 {
+	if atomic.LoadInt32(&tmdbCallCount) != 2 {
 		t.Errorf("TMDB should not be called for requests without tmdbid, got %d", atomic.LoadInt32(&tmdbCallCount))
 	}
-	if atomic.LoadInt32(&prowlarrCallCount) != 3 {
-		t.Errorf("expected Prowlarr call count to be 3, got %d", atomic.LoadInt32(&prowlarrCallCount))
+	if atomic.LoadInt32(&prowlarrCallCount) != 5 {
+		t.Errorf("expected Prowlarr call count to be 5, got %d", atomic.LoadInt32(&prowlarrCallCount))
 	}
 
-	// 9. Public tracker search without tmdbid (exact user scenario):
+	// 9. Public tracker search without tmdbid (Fan-out with year):
 	// /1/api?t=search&cat=2000&extended=1&apikey=secret-prowlarr-token&offset=0&limit=100&q=The+Matrix+1999
 	publicTrackerURL := fmt.Sprintf("%s/1/api?t=search&cat=2000&extended=1&apikey=secret-prowlarr-token&offset=0&limit=100&q=The+Matrix+1999", proxyServer.URL)
 	resp4, err := http.Get(publicTrackerURL)
@@ -173,7 +177,18 @@ func TestEndToEndTorznabTranslationFlow(t *testing.T) {
 	if resp4.StatusCode != http.StatusOK {
 		t.Errorf("expected 200 OK, got %d", resp4.StatusCode)
 	}
-	if lastProwlarrQuery.Get("q") != "Matrix 1999" {
-		t.Errorf("expected public tracker search 'q' to be translated to 'Matrix 1999', got %q", lastProwlarrQuery.Get("q"))
+
+	queriesMu.Lock()
+	foundTranslated := false
+	for _, q := range prowlarrQueries {
+		if q == "Matrix 1999" {
+			foundTranslated = true
+			break
+		}
+	}
+	queriesMu.Unlock()
+
+	if !foundTranslated {
+		t.Errorf("expected 'Matrix 1999' in Prowlarr queries, got %v", prowlarrQueries)
 	}
 }

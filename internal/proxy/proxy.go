@@ -2,31 +2,65 @@ package proxy
 
 import (
 	"context"
+	"encoding/xml"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
-// TitleFetcher is an abstraction for querying localized movie titles.
+// TitleFetcher is an abstraction for querying localized movie titles and search candidates.
 type TitleFetcher interface {
 	GetMovieTitle(ctx context.Context, tmdbID string) (string, error)
 	TranslateByQuery(ctx context.Context, query string) (string, error)
+	GetSearchCandidates(ctx context.Context, rawQuery, tmdbID string) ([]string, error)
 }
 
-// Proxy is a Torznab reverse proxy middleware that translates English movie search
-// queries into Brazilian Portuguese (pt-BR) using the TMDB API before forwarding to Prowlarr.
+// TorznabFeed represents the root RSS Torznab XML document.
+type TorznabFeed struct {
+	XMLName      xml.Name       `xml:"rss"`
+	Version      string         `xml:"version,attr,omitempty"`
+	XMLNSTorznab string         `xml:"xmlns:torznab,attr,omitempty"`
+	XMLNSAtom    string         `xml:"xmlns:atom,attr,omitempty"`
+	Channel      TorznabChannel `xml:"channel"`
+}
+
+// TorznabChannel represents the RSS channel element containing indexer metadata and items.
+type TorznabChannel struct {
+	XMLName     xml.Name      `xml:"channel"`
+	Title       string        `xml:"title,omitempty"`
+	Description string        `xml:"description,omitempty"`
+	Link        string        `xml:"link,omitempty"`
+	Language    string        `xml:"language,omitempty"`
+	Category    string        `xml:"category,omitempty"`
+	Items       []TorznabItem `xml:"item"`
+}
+
+// TorznabItem represents an individual torrent release in the Torznab feed.
+// Using innerxml preserves all sub-elements (torznab:attr, enclosures, etc.) intact.
+type TorznabItem struct {
+	XMLName  xml.Name `xml:"item"`
+	Guid     string   `xml:"guid"`
+	Link     string   `xml:"link"`
+	InnerXML []byte   `xml:",innerxml"`
+}
+
+// Proxy is a Torznab reverse proxy middleware that performs fan-out searches
+// across multiple title variations (pt-BR official, alternatives, and original)
+// and merges their XML responses into a unified, deduplicated feed.
 type Proxy struct {
 	upstreamURL  *url.URL
 	titleFetcher TitleFetcher
 	reverseProxy *httputil.ReverseProxy
+	httpClient   *http.Client
 	logger       *log.Logger
 }
 
-// responseRecorder captures the status code sent to the client for structured logging.
 type responseRecorder struct {
 	http.ResponseWriter
 	statusCode int
@@ -47,24 +81,19 @@ func NewProxy(upstreamURL *url.URL, titleFetcher TitleFetcher, logger *log.Logge
 		upstreamURL:  upstreamURL,
 		titleFetcher: titleFetcher,
 		logger:       logger,
+		httpClient:   &http.Client{Timeout: 15 * time.Second},
 	}
 
-	// Initialize standard library reverse proxy
 	revProxy := httputil.NewSingleHostReverseProxy(upstreamURL)
 
-	// Custom Director: adjusts upstream scheme, host, and headers
 	originalDirector := revProxy.Director
 	revProxy.Director = func(req *http.Request) {
 		originalDirector(req)
-		// Ensure upstream Host matches the target host
 		req.Host = upstreamURL.Host
-
-		// Set forwarding headers
 		req.Header.Set("X-Forwarded-Host", req.Host)
 		req.Header.Set("X-Forwarded-Proto", upstreamURL.Scheme)
 	}
 
-	// Custom ErrorHandler to return 502 Bad Gateway if Prowlarr is unreachable
 	revProxy.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
 		p.logger.Printf("[PROXY ERROR] Failed to connect to upstream Prowlarr (%s): %v", upstreamURL.String(), err)
 		http.Error(w, fmt.Sprintf("502 Bad Gateway: Upstream Prowlarr (%s) is unreachable: %v", upstreamURL.String(), err), http.StatusBadGateway)
@@ -74,11 +103,13 @@ func NewProxy(upstreamURL *url.URL, titleFetcher TitleFetcher, logger *log.Logge
 	return p
 }
 
-// ServeHTTP handles incoming requests, intercepts tmdbid, modifies query, and proxies to upstream.
+// ServeHTTP handles incoming requests.
+// For search requests, it executes Fan-Out aggregation across title variations.
+// For non-search requests (caps, ping, healthz), it passes through directly.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
-	// 1. Health check endpoint for monitoring / LXC liveness
+	// 1. Health check endpoint
 	if r.URL.Path == "/healthz" || r.URL.Path == "/ping" {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
@@ -92,39 +123,195 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rawQ := strings.TrimSpace(queryParams.Get("q"))
 	tType := strings.TrimSpace(queryParams.Get("t"))
 
-	// 3. Intercept & translate
-	if p.titleFetcher != nil {
-		if tmdbID != "" {
-			// Scenario A: tmdbid is explicitly present
-			translatedTitle, err := p.titleFetcher.GetMovieTitle(r.Context(), tmdbID)
-			if err != nil {
-				p.logger.Printf("[TMDB WARNING] tmdbid=%s lookup failed: %v (keeping original q=%q)", tmdbID, err, rawQ)
-			} else if translatedTitle != "" {
-				queryParams.Set("q", translatedTitle)
-				r.URL.RawQuery = queryParams.Encode()
-				p.logger.Printf("[TMDB TRANSLATE (by ID)] tmdbid=%s: %q -> %q", tmdbID, rawQ, translatedTitle)
-			}
-		} else if rawQ != "" && (tType == "search" || tType == "movie" || tType == "") {
-			// Scenario B: Public tracker search with only 'q' (e.g. t=search&q=Pirates+of+Silicon+Valley+1999)
-			translatedTitle, err := p.titleFetcher.TranslateByQuery(r.Context(), rawQ)
-			if err != nil {
-				p.logger.Printf("[TMDB WARNING] text search translation for %q failed: %v (keeping original)", rawQ, err)
-			} else if translatedTitle != "" {
-				queryParams.Set("q", translatedTitle)
-				r.URL.RawQuery = queryParams.Encode()
-				p.logger.Printf("[TMDB TRANSLATE (by Search)] %q -> %q", rawQ, translatedTitle)
-			}
+	// Check if this is a search request
+	isSearch := (tType == "search" || tType == "movie" || rawQ != "" || tmdbID != "") && tType != "caps"
+
+	// 3. For non-search requests (e.g., t=caps), pass through transparently
+	if !isSearch || p.titleFetcher == nil {
+		recorder := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+		p.reverseProxy.ServeHTTP(recorder, r)
+		p.logger.Printf("[PROXY PASSTHROUGH] %s %s -> status=%d duration=%v", r.Method, r.URL.RequestURI(), recorder.statusCode, time.Since(start))
+		return
+	}
+
+	// 4. Resolve candidate search titles from TMDB (Official pt-BR, Alternatives BR/PT, Original)
+	candidates, err := p.titleFetcher.GetSearchCandidates(r.Context(), rawQ, tmdbID)
+	if err != nil {
+		p.logger.Printf("[PROXY WARNING] Failed to get TMDB candidates for q=%q tmdbid=%s: %v (falling back to original)", rawQ, tmdbID, err)
+	}
+
+	if len(candidates) == 0 {
+		if rawQ != "" {
+			candidates = []string{rawQ}
+		} else {
+			// No search term could be resolved, fallback to passthrough
+			recorder := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+			p.reverseProxy.ServeHTTP(recorder, r)
+			return
 		}
 	}
 
-	// 4. Wrap response writer to capture status code for logging
-	recorder := &responseRecorder{
-		ResponseWriter: w,
-		statusCode:     http.StatusOK, // Default if WriteHeader is not explicitly called
+	p.logger.Printf("[FAN-OUT START] Initiating %d concurrent Prowlarr searches: %v", len(candidates), candidates)
+
+	// 5. Fan-Out: Execute concurrent queries to Prowlarr for each candidate title
+	type queryResult struct {
+		query string
+		feed  *TorznabFeed
+		err   error
 	}
 
-	// 5. Forward to upstream Prowlarr and pipe response back to Radarr
-	p.reverseProxy.ServeHTTP(recorder, r)
+	resultsChan := make(chan queryResult, len(candidates))
+	var wg sync.WaitGroup
 
-	p.logger.Printf("[PROXY] %s %s -> status=%d duration=%v", r.Method, r.URL.RequestURI(), recorder.statusCode, time.Since(start))
+	for _, cand := range candidates {
+		wg.Add(1)
+		go func(titleQuery string) {
+			defer wg.Done()
+			feed, err := p.fetchProwlarrFeed(r.Context(), r, titleQuery)
+			resultsChan <- queryResult{query: titleQuery, feed: feed, err: err}
+		}(cand)
+	}
+
+	wg.Wait()
+	close(resultsChan)
+
+	// 6. Collect successful responses
+	var successfulFeeds []*TorznabFeed
+	for res := range resultsChan {
+		if res.err != nil {
+			p.logger.Printf("[FAN-OUT WARNING] Upstream query %q failed: %v", res.query, res.err)
+			continue
+		}
+		if res.feed != nil {
+			successfulFeeds = append(successfulFeeds, res.feed)
+		}
+	}
+
+	// If all requests failed, return 502 Bad Gateway
+	if len(successfulFeeds) == 0 {
+		p.logger.Printf("[FAN-OUT ERROR] All %d upstream Prowlarr queries failed", len(candidates))
+		http.Error(w, "502 Bad Gateway: All upstream Prowlarr queries failed", http.StatusBadGateway)
+		return
+	}
+
+	// 7. Merge feeds and deduplicate items based on <guid> or <link>
+	mergedFeed, totalCount, dupsRemoved := mergeTorznabFeeds(successfulFeeds)
+	p.logger.Printf("[FAN-OUT MERGE] Merged %d total items (%d duplicates removed) -> %d unique items returned in %v",
+		totalCount, dupsRemoved, len(mergedFeed.Channel.Items), time.Since(start))
+
+	// 8. Output unified XML to Radarr
+	w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(xml.Header))
+
+	enc := xml.NewEncoder(w)
+	enc.Indent("", "  ")
+	if err := enc.Encode(mergedFeed); err != nil {
+		p.logger.Printf("[PROXY ERROR] Failed to encode merged Torznab XML: %v", err)
+	}
+}
+
+// fetchProwlarrFeed executes an HTTP request to upstream Prowlarr with the modified query parameter.
+func (p *Proxy) fetchProwlarrFeed(ctx context.Context, originalReq *http.Request, queryParam string) (*TorznabFeed, error) {
+	targetURL := *p.upstreamURL
+	targetURL.Path = singleJoiningSlash(targetURL.Path, originalReq.URL.Path)
+
+	q := originalReq.URL.Query()
+	q.Set("q", queryParam)
+	targetURL.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create upstream request: %w", err)
+	}
+
+	// Copy important headers from Radarr request (API Key, User-Agent, Accept, etc.)
+	for k, vv := range originalReq.Header {
+		lowerK := strings.ToLower(k)
+		if lowerK == "accept" || lowerK == "user-agent" || lowerK == "authorization" || strings.HasPrefix(lowerK, "x-") {
+			for _, v := range vv {
+				req.Header.Add(k, v)
+			}
+		}
+	}
+	req.Host = p.upstreamURL.Host
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("upstream request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("upstream HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
+	}
+
+	var feed TorznabFeed
+	if err := xml.NewDecoder(resp.Body).Decode(&feed); err != nil {
+		return nil, fmt.Errorf("failed to decode Torznab XML: %w", err)
+	}
+
+	return &feed, nil
+}
+
+// mergeTorznabFeeds merges items from multiple feeds and removes duplicates based on GUID or Link.
+func mergeTorznabFeeds(feeds []*TorznabFeed) (merged *TorznabFeed, totalItems, duplicatesRemoved int) {
+	if len(feeds) == 0 {
+		return &TorznabFeed{
+			Version:      "2.0",
+			XMLNSTorznab: "http://torznab.com/schemas/2015/feed",
+			XMLNSAtom:    "http://www.w3.org/2005/Atom",
+		}, 0, 0
+	}
+
+	baseFeed := *feeds[0]
+	if baseFeed.Version == "" {
+		baseFeed.Version = "2.0"
+	}
+	if baseFeed.XMLNSTorznab == "" {
+		baseFeed.XMLNSTorznab = "http://torznab.com/schemas/2015/feed"
+	}
+	if baseFeed.XMLNSAtom == "" {
+		baseFeed.XMLNSAtom = "http://www.w3.org/2005/Atom"
+	}
+
+	seenKeys := make(map[string]bool)
+	var uniqueItems []TorznabItem
+
+	for _, feed := range feeds {
+		for _, item := range feed.Channel.Items {
+			totalItems++
+
+			dedupKey := strings.TrimSpace(item.Guid)
+			if dedupKey == "" {
+				dedupKey = strings.TrimSpace(item.Link)
+			}
+
+			if dedupKey != "" && seenKeys[dedupKey] {
+				duplicatesRemoved++
+				continue
+			}
+
+			if dedupKey != "" {
+				seenKeys[dedupKey] = true
+			}
+			uniqueItems = append(uniqueItems, item)
+		}
+	}
+
+	baseFeed.Channel.Items = uniqueItems
+	return &baseFeed, totalItems, duplicatesRemoved
+}
+
+func singleJoiningSlash(a, b string) string {
+	aslash := strings.HasSuffix(a, "/")
+	bslash := strings.HasPrefix(b, "/")
+	switch {
+	case aslash && bslash:
+		return a + b[1:]
+	case !aslash && !bslash:
+		return a + "/" + b
+	}
+	return a + b
 }

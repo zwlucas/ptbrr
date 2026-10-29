@@ -2,19 +2,22 @@ package proxy
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 )
 
 type mockTitleFetcher struct {
-	titles  map[string]string
-	queries map[string]string
-	err     error
+	titles     map[string]string
+	queries    map[string]string
+	candidates map[string][]string
+	err        error
 }
 
 func (m *mockTitleFetcher) GetMovieTitle(ctx context.Context, tmdbID string) (string, error) {
@@ -35,6 +38,28 @@ func (m *mockTitleFetcher) TranslateByQuery(ctx context.Context, query string) (
 		return title, nil
 	}
 	return "", fmt.Errorf("query %q not found in mock", query)
+}
+
+func (m *mockTitleFetcher) GetSearchCandidates(ctx context.Context, rawQuery, tmdbID string) ([]string, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	if list, ok := m.candidates[rawQuery]; ok {
+		return list, nil
+	}
+	if list, ok := m.candidates[tmdbID]; ok {
+		return list, nil
+	}
+	if title, ok := m.queries[rawQuery]; ok {
+		return []string{title}, nil
+	}
+	if title, ok := m.titles[tmdbID]; ok {
+		return []string{title}, nil
+	}
+	if rawQuery != "" {
+		return []string{rawQuery}, nil
+	}
+	return nil, fmt.Errorf("no candidates found in mock for query %q / id %q", rawQuery, tmdbID)
 }
 
 func TestProxy_TranslationSuccess(t *testing.T) {
@@ -90,14 +115,11 @@ func TestProxy_TranslationSuccess(t *testing.T) {
 	}
 
 	// Verify exact XML response returned to Radarr
-	if string(body) != sampleXML {
-		t.Errorf("expected XML body %q, got %q", sampleXML, string(body))
+	if !strings.Contains(string(body), "Piratas do Vale do Silicio 1080p") {
+		t.Errorf("expected XML body to contain item, got %q", string(body))
 	}
 	if resp.Header.Get("Content-Type") != "application/rss+xml; charset=utf-8" {
 		t.Errorf("unexpected Content-Type header: %s", resp.Header.Get("Content-Type"))
-	}
-	if resp.Header.Get("X-Custom-Prowlarr-Header") != "torznab-feed" {
-		t.Errorf("unexpected custom header: %s", resp.Header.Get("X-Custom-Prowlarr-Header"))
 	}
 
 	// Verify upstream received the translated query
@@ -157,8 +179,9 @@ func TestProxy_GracefulFallbackOnTMDBError(t *testing.T) {
 
 	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedQuery = r.URL.Query()
+		w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("<fallback></fallback>"))
+		_, _ = w.Write([]byte(`<rss version="2.0"><channel><title>Prowlarr</title></channel></rss>`))
 	}))
 	defer upstreamServer.Close()
 
@@ -268,5 +291,79 @@ func TestProxy_PublicTrackerTextSearchTranslation(t *testing.T) {
 	}
 	if receivedQuery.Get("apikey") != "CHAVE" {
 		t.Errorf("expected apikey preserved, got %q", receivedQuery.Get("apikey"))
+	}
+}
+
+func TestProxy_FanOutAndMergeDeduplication(t *testing.T) {
+	// Upstream Prowlarr returns different results depending on the query 'q'
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("q")
+		w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+
+		switch query {
+		case "Piratas da Informática 1999":
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?><rss version="2.0"><channel><title>Prowlarr</title>
+				<item><title>Piratas da Informatica 1080p</title><guid>guid-1</guid><link>http://t.co/1</link></item>
+			</channel></rss>`))
+		case "Piratas do Vale do Silício 1999":
+			// Returns guid-2 and a duplicate guid-1
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?><rss version="2.0"><channel><title>Prowlarr</title>
+				<item><title>Piratas do Vale do Silicio 720p</title><guid>guid-2</guid><link>http://t.co/2</link></item>
+				<item><title>Piratas da Informatica 1080p (dup)</title><guid>guid-1</guid><link>http://t.co/1</link></item>
+			</channel></rss>`))
+		case "Pirates of Silicon Valley 1999":
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?><rss version="2.0"><channel><title>Prowlarr</title>
+				<item><title>Pirates of Silicon Valley BluRay</title><guid>guid-3</guid><link>http://t.co/3</link></item>
+			</channel></rss>`))
+		default:
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?><rss version="2.0"><channel><title>Prowlarr</title></channel></rss>`))
+		}
+	}))
+	defer upstreamServer.Close()
+
+	upstreamURL, _ := url.Parse(upstreamServer.URL)
+	fetcher := &mockTitleFetcher{
+		candidates: map[string][]string{
+			"Pirates of Silicon Valley 1999": {
+				"Piratas da Informática 1999",
+				"Piratas do Vale do Silício 1999",
+				"Pirates of Silicon Valley 1999",
+			},
+		},
+	}
+
+	proxyHandler := NewProxy(upstreamURL, fetcher, nil)
+	proxyServer := httptest.NewServer(proxyHandler)
+	defer proxyServer.Close()
+
+	reqURL := fmt.Sprintf("%s/1/api?t=search&q=Pirates%%20of%%20Silicon%%20Valley%%201999", proxyServer.URL)
+	resp, err := http.Get(reqURL)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var feed TorznabFeed
+	if err := xml.Unmarshal(body, &feed); err != nil {
+		t.Fatalf("failed to unmarshal merged Torznab XML: %v", err)
+	}
+
+	// Should contain exactly 3 items: guid-1, guid-2, guid-3 (the duplicate guid-1 is removed)
+	if len(feed.Channel.Items) != 3 {
+		t.Errorf("expected 3 merged items after deduplication, got %d", len(feed.Channel.Items))
+	}
+
+	guids := make(map[string]bool)
+	for _, item := range feed.Channel.Items {
+		guids[item.Guid] = true
+	}
+	if !guids["guid-1"] || !guids["guid-2"] || !guids["guid-3"] {
+		t.Errorf("missing expected guids in merged feed: %v", guids)
 	}
 }

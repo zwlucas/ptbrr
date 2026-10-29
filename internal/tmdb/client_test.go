@@ -256,3 +256,94 @@ func TestExtractYearAndCleanTitle(t *testing.T) {
 		}
 	}
 }
+
+func TestGetAlternativeTitles_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/movie/12345/alternative_titles" {
+			http.NotFound(w, r)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"id": 12345,
+			"titles": []map[string]interface{}{
+				{"iso_3166_1": "BR", "title": "Piratas do Vale do Silício"},
+				{"iso_3166_1": "PT", "title": "Piratas de Silicon Valley"},
+				{"iso_3166_1": "ES", "title": "Piratas de Silicon Valley (ES)"},
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient("test-key", server.URL, 5*time.Second, 1*time.Hour)
+	alts, err := client.GetAlternativeTitles(context.Background(), "12345")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should only have BR and PT (2 titles)
+	if len(alts) != 2 {
+		t.Fatalf("expected 2 alternative titles, got %d: %v", len(alts), alts)
+	}
+	if alts[0] != "Piratas do Vale do Silício" || alts[1] != "Piratas de Silicon Valley" {
+		t.Errorf("unexpected titles: %v", alts)
+	}
+}
+
+func TestGetSearchCandidates(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.URL.Path {
+		case "/search/movie":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"results": []map[string]interface{}{
+					{"id": 12345, "title": "Pirates of Silicon Valley"},
+				},
+			})
+		case "/movie/12345":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":    12345,
+				"title": "Piratas da Informática",
+			})
+		case "/movie/12345/alternative_titles":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id": 12345,
+				"titles": []map[string]interface{}{
+					{"iso_3166_1": "BR", "title": "Piratas do Vale do Silício"},
+					{"iso_3166_1": "US", "title": "Silicon Valley Pirates"},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient("test-key", server.URL, 5*time.Second, 1*time.Hour)
+
+	candidates, err := client.GetSearchCandidates(context.Background(), "Pirates of Silicon Valley 1999", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Expected candidates:
+	// 1. "Piratas da Informática 1999" (Official pt-BR + year)
+	// 2. "Piratas do Vale do Silício 1999" (Alternative BR + year)
+	// 3. "Pirates of Silicon Valley 1999" (Original query)
+	expected := []string{
+		"Piratas da Informática 1999",
+		"Piratas do Vale do Silício 1999",
+		"Pirates of Silicon Valley 1999",
+	}
+
+	if len(candidates) != len(expected) {
+		t.Fatalf("expected %d candidates, got %d: %v", len(expected), len(candidates), candidates)
+	}
+	for i, exp := range expected {
+		if candidates[i] != exp {
+			t.Errorf("candidate[%d] = %q, expected %q", i, candidates[i], exp)
+		}
+	}
+}

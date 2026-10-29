@@ -36,6 +36,11 @@ type cacheEntry struct {
 	expiresAt time.Time
 }
 
+type candidatesCacheEntry struct {
+	titles    []string
+	expiresAt time.Time
+}
+
 // Client interacts with the TMDB API and caches responses in memory.
 type Client struct {
 	apiKey     string
@@ -43,8 +48,9 @@ type Client struct {
 	httpClient *http.Client
 	cacheTTL   time.Duration
 
-	mu    sync.RWMutex
-	cache map[string]cacheEntry
+	mu              sync.RWMutex
+	cache           map[string]cacheEntry
+	candidatesCache map[string]candidatesCacheEntry
 }
 
 // NewClient initializes a new TMDB client.
@@ -62,11 +68,12 @@ func NewClient(apiKey, baseURL string, timeout, cacheTTL time.Duration) *Client 
 	}
 
 	return &Client{
-		apiKey:     apiKey,
-		baseURL:    baseURL,
-		httpClient: &http.Client{Timeout: timeout},
-		cacheTTL:   cacheTTL,
-		cache:      make(map[string]cacheEntry),
+		apiKey:          apiKey,
+		baseURL:         baseURL,
+		httpClient:      &http.Client{Timeout: timeout},
+		cacheTTL:        cacheTTL,
+		cache:           make(map[string]cacheEntry),
+		candidatesCache: make(map[string]candidatesCacheEntry),
 	}
 }
 
@@ -87,6 +94,193 @@ type searchMovieResponse struct {
 		ReleaseDate   string `json:"release_date"`
 	} `json:"results"`
 	TotalResults int `json:"total_results"`
+}
+
+// alternativeTitlesResponse matches TMDB /movie/{tmdbid}/alternative_titles JSON response.
+type alternativeTitlesResponse struct {
+	ID     int64 `json:"id"`
+	Titles []struct {
+		ISO3166_1 string `json:"iso_3166_1"`
+		Title     string `json:"title"`
+		Type      string `json:"type"`
+	} `json:"titles"`
+}
+
+// GetAlternativeTitles fetches Portuguese alternative titles (iso_3166_1: "BR" or "PT") for a given movie ID.
+func (c *Client) GetAlternativeTitles(ctx context.Context, movieID string) ([]string, error) {
+	movieID = strings.TrimSpace(movieID)
+	if movieID == "" {
+		return nil, ErrEmptyTMDBID
+	}
+	if c.apiKey == "" {
+		return nil, ErrMissingAPIKey
+	}
+
+	endpoint := fmt.Sprintf("%s/movie/%s/alternative_titles?api_key=%s",
+		c.baseURL,
+		url.PathEscape(movieID),
+		url.QueryEscape(c.apiKey),
+	)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create alternative titles request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "ptbrr-proxy/1.0")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("alternative titles request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("TMDB alternative titles returned HTTP %d", resp.StatusCode)
+	}
+
+	var altResp alternativeTitlesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&altResp); err != nil {
+		return nil, fmt.Errorf("failed to decode alternative titles JSON: %w", err)
+	}
+
+	var titles []string
+	for _, t := range altResp.Titles {
+		iso := strings.ToUpper(strings.TrimSpace(t.ISO3166_1))
+		cleanT := strings.TrimSpace(t.Title)
+		if (iso == "BR" || iso == "PT") && cleanT != "" {
+			titles = append(titles, cleanT)
+		}
+	}
+
+	return titles, nil
+}
+
+// GetSearchCandidates resolves the movie ID and fetches:
+// 1. The official localized pt-BR title
+// 2. Alternative titles for BR and PT
+// 3. The original search query
+// It attaches the original release year (if found) to each title and returns a deduplicated slice.
+func (c *Client) GetSearchCandidates(ctx context.Context, rawQuery, tmdbID string) ([]string, error) {
+	rawQuery = strings.TrimSpace(rawQuery)
+	tmdbID = strings.TrimSpace(tmdbID)
+	cleanTitle, year := extractYearAndCleanTitle(rawQuery)
+
+	movieID := tmdbID
+	if movieID == "" && cleanTitle != "" {
+		// Resolve movie ID by querying /search/movie
+		searchURL := fmt.Sprintf("%s/search/movie?api_key=%s&query=%s",
+			c.baseURL,
+			url.QueryEscape(c.apiKey),
+			url.QueryEscape(cleanTitle),
+		)
+		if year != "" {
+			searchURL += fmt.Sprintf("&year=%s", url.QueryEscape(year))
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, searchURL, nil)
+		if err == nil {
+			req.Header.Set("Accept", "application/json")
+			req.Header.Set("User-Agent", "ptbrr-proxy/1.0")
+			if resp, err := c.httpClient.Do(req); err == nil {
+				defer resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					var sResp searchMovieResponse
+					if err := json.NewDecoder(resp.Body).Decode(&sResp); err == nil && len(sResp.Results) > 0 {
+						movieID = strconv.FormatInt(sResp.Results[0].ID, 10)
+					}
+				}
+			}
+		}
+	}
+
+	// If no movie ID could be found, return the raw query as fallback
+	if movieID == "" {
+		if rawQuery != "" {
+			return []string{rawQuery}, nil
+		}
+		return nil, errors.New("could not identify movie from query")
+	}
+
+	// Check candidate cache
+	cacheKey := fmt.Sprintf("candidates:%s:%s", movieID, year)
+	c.mu.RLock()
+	entry, found := c.candidatesCache[cacheKey]
+	c.mu.RUnlock()
+	if found && time.Now().Before(entry.expiresAt) {
+		return entry.titles, nil
+	}
+
+	// Concurrently fetch official pt-BR title and alternative titles
+	var officialTitle string
+	var altTitles []string
+	var wg sync.WaitGroup
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if t, err := c.GetMovieTitle(ctx, movieID); err == nil && t != "" {
+			officialTitle = t
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		if alts, err := c.GetAlternativeTitles(ctx, movieID); err == nil {
+			altTitles = alts
+		}
+	}()
+
+	wg.Wait()
+
+	// Assemble and deduplicate candidate list
+	seen := make(map[string]bool)
+	var candidates []string
+
+	addCandidate := func(title string) {
+		title = strings.TrimSpace(title)
+		if title == "" {
+			return
+		}
+		if year != "" && !strings.Contains(title, year) {
+			title = fmt.Sprintf("%s %s", title, year)
+		}
+		normalized := strings.ToLower(title)
+		if !seen[normalized] {
+			seen[normalized] = true
+			candidates = append(candidates, title)
+		}
+	}
+
+	// 1. Official pt-BR title
+	if officialTitle != "" {
+		addCandidate(officialTitle)
+	}
+
+	// 2. Alternative BR / PT titles
+	for _, alt := range altTitles {
+		addCandidate(alt)
+	}
+
+	// 3. Original query (fallback)
+	if rawQuery != "" {
+		addCandidate(rawQuery)
+	}
+
+	// If still empty, fallback to rawQuery
+	if len(candidates) == 0 && rawQuery != "" {
+		candidates = []string{rawQuery}
+	}
+
+	// Cache candidates
+	c.mu.Lock()
+	c.candidatesCache[cacheKey] = candidatesCacheEntry{
+		titles:    candidates,
+		expiresAt: time.Now().Add(c.cacheTTL),
+	}
+	c.mu.Unlock()
+
+	return candidates, nil
 }
 
 // extractYearAndCleanTitle extracts the 4-digit year at the end of a title query if present.
