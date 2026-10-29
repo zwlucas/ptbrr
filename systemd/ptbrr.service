@@ -1,0 +1,27 @@
+[Unit]
+Description=ptbrr - Torznab pt-BR Translation Reverse Proxy
+Documentation=https://github.com/lucasfariamm/ptbrr
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ptbrr
+Group=ptbrr
+EnvironmentFile=/etc/ptbrr/ptbrr.env
+ExecStart=/usr/local/bin/ptbrr
+Restart=always
+RestartSec=5s
+
+# Security and Sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/run
+
+# Resource Limits
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
