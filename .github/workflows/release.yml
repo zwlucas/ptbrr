@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Release Multi-Arch Binaries
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          check-latest: true
+
+      - name: Run Tests
+        run: |
+          go test -v ./...
+
+      - name: Build Binaries (Linux amd64 & arm64)
+        run: |
+          mkdir -p dist
+          VERSION="${{ github.ref_name }}"
+          LDFLAGS="-s -w -X main.version=${VERSION}"
+
+          echo "Building for Linux amd64..."
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="${LDFLAGS}" -o dist/ptbrr-linux-amd64 .
+
+          echo "Building for Linux arm64..."
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="${LDFLAGS}" -o dist/ptbrr-linux-arm64 .
+
+          # Package compressed archives for convenience
+          cd dist
+          tar -czvf ptbrr-${VERSION}-linux-amd64.tar.gz ptbrr-linux-amd64
+          tar -czvf ptbrr-${VERSION}-linux-arm64.tar.gz ptbrr-linux-arm64
+
+          # Generate SHA-256 Checksums for integrity verification
+          sha256sum ptbrr-* > checksums.txt
+          cd ..
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "ptbrr ${{ github.ref_name }}"
+          files: |
+            dist/ptbrr-linux-amd64
+            dist/ptbrr-linux-arm64
+            dist/*.tar.gz
+            dist/checksums.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false
