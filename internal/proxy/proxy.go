@@ -134,21 +134,29 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Resolve candidate search titles from TMDB (Official pt-BR, Alternatives BR/PT, Original)
+	// 4. Resolve candidate search titles from TMDB (Exclusively Portuguese titles: Official pt-BR and Alternatives)
 	candidates, err := p.titleFetcher.GetSearchCandidates(r.Context(), rawQ, tmdbID)
 	if err != nil {
-		p.logger.Printf("[PROXY WARNING] Failed to get TMDB candidates for q=%q tmdbid=%s: %v (falling back to original)", rawQ, tmdbID, err)
+		p.logger.Printf("[PROXY WARNING] Failed to get TMDB candidates for q=%q tmdbid=%s: %v", rawQ, tmdbID, err)
 	}
 
+	// Rule 2: Strictly return Portuguese titles. If none found, return empty feed without querying English fallback.
 	if len(candidates) == 0 {
-		if rawQ != "" {
-			candidates = []string{rawQ}
-		} else {
-			// No search term could be resolved, fallback to passthrough
-			recorder := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
-			p.reverseProxy.ServeHTTP(recorder, r)
-			return
+		p.logger.Printf("[PROXY] No Portuguese titles found for q=%q tmdbid=%s. Returning empty feed (English fallback disabled).", rawQ, tmdbID)
+		emptyFeed := &TorznabFeed{
+			Version:      "2.0",
+			XMLNSTorznab: "http://torznab.com/schemas/2015/feed",
+			XMLNSAtom:    "http://www.w3.org/2005/Atom",
+			Channel: TorznabChannel{
+				Title: "Prowlarr",
+				Items: []TorznabItem{},
+			},
 		}
+		w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(xml.Header))
+		_ = xml.NewEncoder(w).Encode(emptyFeed)
+		return
 	}
 
 	p.logger.Printf("[FAN-OUT START] Initiating %d concurrent Prowlarr searches: %v", len(candidates), candidates)
@@ -167,6 +175,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(titleQuery string) {
 			defer wg.Done()
+			// Rule 3: Individual log inside goroutine
+			p.logger.Printf("[FAN-OUT] Executing GET for: %q", titleQuery)
 			feed, err := p.fetchProwlarrFeed(r.Context(), r, titleQuery)
 			resultsChan <- queryResult{query: titleQuery, feed: feed, err: err}
 		}(cand)

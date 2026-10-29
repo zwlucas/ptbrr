@@ -233,7 +233,7 @@ func (c *Client) GetSearchCandidates(ctx context.Context, rawQuery, tmdbID strin
 
 	wg.Wait()
 
-	// Assemble and deduplicate candidate list
+	// Assemble and deduplicate clean Portuguese title candidate list (NO year appended, NO English fallback)
 	seen := make(map[string]bool)
 	var candidates []string
 
@@ -242,9 +242,6 @@ func (c *Client) GetSearchCandidates(ctx context.Context, rawQuery, tmdbID strin
 		if title == "" {
 			return
 		}
-		if year != "" && !strings.Contains(title, year) {
-			title = fmt.Sprintf("%s %s", title, year)
-		}
 		normalized := strings.ToLower(title)
 		if !seen[normalized] {
 			seen[normalized] = true
@@ -252,24 +249,14 @@ func (c *Client) GetSearchCandidates(ctx context.Context, rawQuery, tmdbID strin
 		}
 	}
 
-	// 1. Official pt-BR title
+	// 1. Official pt-BR title (clean, without year)
 	if officialTitle != "" {
 		addCandidate(officialTitle)
 	}
 
-	// 2. Alternative BR / PT titles
+	// 2. Alternative BR / PT titles (clean, without year)
 	for _, alt := range altTitles {
 		addCandidate(alt)
-	}
-
-	// 3. Original query (fallback)
-	if rawQuery != "" {
-		addCandidate(rawQuery)
-	}
-
-	// If still empty, fallback to rawQuery
-	if len(candidates) == 0 && rawQuery != "" {
-		candidates = []string{rawQuery}
 	}
 
 	// Cache candidates

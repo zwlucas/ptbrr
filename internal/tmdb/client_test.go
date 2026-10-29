@@ -328,14 +328,12 @@ func TestGetSearchCandidates(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Expected candidates:
-	// 1. "Piratas da Informática 1999" (Official pt-BR + year)
-	// 2. "Piratas do Vale do Silício 1999" (Alternative BR + year)
-	// 3. "Pirates of Silicon Valley 1999" (Original query)
+	// Expected candidates (NO year appended, NO English fallback):
+	// 1. "Piratas da Informática" (Official pt-BR)
+	// 2. "Piratas do Vale do Silício" (Alternative BR)
 	expected := []string{
-		"Piratas da Informática 1999",
-		"Piratas do Vale do Silício 1999",
-		"Pirates of Silicon Valley 1999",
+		"Piratas da Informática",
+		"Piratas do Vale do Silício",
 	}
 
 	if len(candidates) != len(expected) {

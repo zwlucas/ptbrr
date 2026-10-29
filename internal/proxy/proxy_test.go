@@ -175,10 +175,10 @@ func TestProxy_PassthroughWithoutTMDBID(t *testing.T) {
 }
 
 func TestProxy_GracefulFallbackOnTMDBError(t *testing.T) {
-	var receivedQuery url.Values
+	var upstreamCalled bool
 
 	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedQuery = r.URL.Query()
+		upstreamCalled = true
 		w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`<rss version="2.0"><channel><title>Prowlarr</title></channel></rss>`))
@@ -194,7 +194,8 @@ func TestProxy_GracefulFallbackOnTMDBError(t *testing.T) {
 	proxyServer := httptest.NewServer(proxyHandler)
 	defer proxyServer.Close()
 
-	// Should fallback and keep original q
+	// When TMDB fails to find Portuguese titles, the proxy strictly suppresses English queries
+	// and returns an empty 200 OK Torznab feed to prevent polluting Radarr with English results.
 	reqURL := fmt.Sprintf("%s/api?q=Original+English+Title&tmdbid=99999", proxyServer.URL)
 	resp, err := http.Get(reqURL)
 	if err != nil {
@@ -205,8 +206,8 @@ func TestProxy_GracefulFallbackOnTMDBError(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("expected 200, got %d", resp.StatusCode)
 	}
-	if receivedQuery.Get("q") != "Original English Title" {
-		t.Errorf("expected fallback to 'Original English Title', got '%s'", receivedQuery.Get("q"))
+	if upstreamCalled {
+		t.Errorf("expected upstream Prowlarr NOT to be called when English fallback is disabled")
 	}
 }
 
@@ -302,19 +303,15 @@ func TestProxy_FanOutAndMergeDeduplication(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 
 		switch query {
-		case "Piratas da Informática 1999":
+		case "Piratas da Informática":
 			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?><rss version="2.0"><channel><title>Prowlarr</title>
 				<item><title>Piratas da Informatica 1080p</title><guid>guid-1</guid><link>http://t.co/1</link></item>
 			</channel></rss>`))
-		case "Piratas do Vale do Silício 1999":
+		case "Piratas do Vale do Silício":
 			// Returns guid-2 and a duplicate guid-1
 			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?><rss version="2.0"><channel><title>Prowlarr</title>
 				<item><title>Piratas do Vale do Silicio 720p</title><guid>guid-2</guid><link>http://t.co/2</link></item>
 				<item><title>Piratas da Informatica 1080p (dup)</title><guid>guid-1</guid><link>http://t.co/1</link></item>
-			</channel></rss>`))
-		case "Pirates of Silicon Valley 1999":
-			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?><rss version="2.0"><channel><title>Prowlarr</title>
-				<item><title>Pirates of Silicon Valley BluRay</title><guid>guid-3</guid><link>http://t.co/3</link></item>
 			</channel></rss>`))
 		default:
 			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?><rss version="2.0"><channel><title>Prowlarr</title></channel></rss>`))
@@ -326,9 +323,8 @@ func TestProxy_FanOutAndMergeDeduplication(t *testing.T) {
 	fetcher := &mockTitleFetcher{
 		candidates: map[string][]string{
 			"Pirates of Silicon Valley 1999": {
-				"Piratas da Informática 1999",
-				"Piratas do Vale do Silício 1999",
-				"Pirates of Silicon Valley 1999",
+				"Piratas da Informática",
+				"Piratas do Vale do Silício",
 			},
 		},
 	}
@@ -354,16 +350,16 @@ func TestProxy_FanOutAndMergeDeduplication(t *testing.T) {
 		t.Fatalf("failed to unmarshal merged Torznab XML: %v", err)
 	}
 
-	// Should contain exactly 3 items: guid-1, guid-2, guid-3 (the duplicate guid-1 is removed)
-	if len(feed.Channel.Items) != 3 {
-		t.Errorf("expected 3 merged items after deduplication, got %d", len(feed.Channel.Items))
+	// Should contain exactly 2 items: guid-1, guid-2 (the duplicate guid-1 is removed)
+	if len(feed.Channel.Items) != 2 {
+		t.Errorf("expected 2 merged items after deduplication, got %d", len(feed.Channel.Items))
 	}
 
 	guids := make(map[string]bool)
 	for _, item := range feed.Channel.Items {
 		guids[item.Guid] = true
 	}
-	if !guids["guid-1"] || !guids["guid-2"] || !guids["guid-3"] {
+	if !guids["guid-1"] || !guids["guid-2"] {
 		t.Errorf("missing expected guids in merged feed: %v", guids)
 	}
 }

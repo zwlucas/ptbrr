@@ -128,12 +128,12 @@ func TestEndToEndTorznabTranslationFlow(t *testing.T) {
 		t.Errorf("expected XML response to contain item, got %q", string(body))
 	}
 
-	// 6. Verify Fan-Out executed Prowlarr searches for both titles
+	// 6. Verify Fan-Out executed Prowlarr search for the Portuguese title (strictly without English fallback)
 	if atomic.LoadInt32(&tmdbCallCount) != 2 {
 		t.Errorf("expected 2 TMDB calls (details + alternative titles), got %d", atomic.LoadInt32(&tmdbCallCount))
 	}
-	if atomic.LoadInt32(&prowlarrCallCount) != 2 {
-		t.Errorf("expected 2 Prowlarr calls (fan-out across candidates), got %d", atomic.LoadInt32(&prowlarrCallCount))
+	if atomic.LoadInt32(&prowlarrCallCount) != 1 {
+		t.Errorf("expected 1 Prowlarr call for 'Matrix' (no English fallback), got %d", atomic.LoadInt32(&prowlarrCallCount))
 	}
 
 	// 7. Verify Cache on 2nd identical request: TMDB should NOT be called again
@@ -146,8 +146,8 @@ func TestEndToEndTorznabTranslationFlow(t *testing.T) {
 	if atomic.LoadInt32(&tmdbCallCount) != 2 {
 		t.Errorf("expected TMDB call count to remain 2 due to cache, got %d", atomic.LoadInt32(&tmdbCallCount))
 	}
-	if atomic.LoadInt32(&prowlarrCallCount) != 4 {
-		t.Errorf("expected Prowlarr call count to be 4, got %d", atomic.LoadInt32(&prowlarrCallCount))
+	if atomic.LoadInt32(&prowlarrCallCount) != 2 {
+		t.Errorf("expected Prowlarr call count to be 2, got %d", atomic.LoadInt32(&prowlarrCallCount))
 	}
 
 	// 8. Test Torznab caps request (no tmdbid): TMDB should NOT be called
@@ -161,11 +161,11 @@ func TestEndToEndTorznabTranslationFlow(t *testing.T) {
 	if atomic.LoadInt32(&tmdbCallCount) != 2 {
 		t.Errorf("TMDB should not be called for requests without tmdbid, got %d", atomic.LoadInt32(&tmdbCallCount))
 	}
-	if atomic.LoadInt32(&prowlarrCallCount) != 5 {
-		t.Errorf("expected Prowlarr call count to be 5, got %d", atomic.LoadInt32(&prowlarrCallCount))
+	if atomic.LoadInt32(&prowlarrCallCount) != 3 {
+		t.Errorf("expected Prowlarr call count to be 3, got %d", atomic.LoadInt32(&prowlarrCallCount))
 	}
 
-	// 9. Public tracker search without tmdbid (Fan-out with year):
+	// 9. Public tracker search without tmdbid (Clean title without year, strictly Portuguese):
 	// /1/api?t=search&cat=2000&extended=1&apikey=secret-prowlarr-token&offset=0&limit=100&q=The+Matrix+1999
 	publicTrackerURL := fmt.Sprintf("%s/1/api?t=search&cat=2000&extended=1&apikey=secret-prowlarr-token&offset=0&limit=100&q=The+Matrix+1999", proxyServer.URL)
 	resp4, err := http.Get(publicTrackerURL)
@@ -179,16 +179,22 @@ func TestEndToEndTorznabTranslationFlow(t *testing.T) {
 	}
 
 	queriesMu.Lock()
-	foundTranslated := false
+	foundCleanTitle := false
+	foundEnglishTitle := false
 	for _, q := range prowlarrQueries {
-		if q == "Matrix 1999" {
-			foundTranslated = true
-			break
+		if q == "Matrix" {
+			foundCleanTitle = true
+		}
+		if q == "The Matrix" || q == "The Matrix 1999" {
+			foundEnglishTitle = true
 		}
 	}
 	queriesMu.Unlock()
 
-	if !foundTranslated {
-		t.Errorf("expected 'Matrix 1999' in Prowlarr queries, got %v", prowlarrQueries)
+	if !foundCleanTitle {
+		t.Errorf("expected clean Portuguese title 'Matrix' in Prowlarr queries, got %v", prowlarrQueries)
+	}
+	if foundEnglishTitle {
+		t.Errorf("found unwanted English query in Prowlarr queries (fallback should be disabled): %v", prowlarrQueries)
 	}
 }
