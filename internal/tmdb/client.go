@@ -31,6 +31,17 @@ var (
 // trailingYearRegex matches a 4-digit release year at the end of the query (e.g., " 1999" or " (1999)").
 var trailingYearRegex = regexp.MustCompile(`(?:\s+|\()(\b(?:19|20)\d{2}\b)\)?\s*$`)
 
+// punctuationRegex matches punctuation characters that break tracker searches (:, -, ,, ., !, ?, _, ', etc.).
+var punctuationRegex = regexp.MustCompile(`[:,\-–—\.\!\?_\'\"/\\()\[\]{}~]`)
+var multiSpaceRegex = regexp.MustCompile(`\s+`)
+
+// CleanTitle removes punctuation and normalizes multiple spaces into a single space.
+func CleanTitle(title string) string {
+	cleaned := punctuationRegex.ReplaceAllString(title, " ")
+	cleaned = multiSpaceRegex.ReplaceAllString(cleaned, " ")
+	return strings.TrimSpace(cleaned)
+}
+
 type cacheEntry struct {
 	title     string
 	expiresAt time.Time
@@ -233,28 +244,28 @@ func (c *Client) GetSearchCandidates(ctx context.Context, rawQuery, tmdbID strin
 
 	wg.Wait()
 
-	// Assemble and deduplicate clean Portuguese title candidate list (NO year appended, NO English fallback)
+	// Assemble and deduplicate clean, sanitized Portuguese title candidate list (NO punctuation, NO year, NO English fallback)
 	seen := make(map[string]bool)
 	var candidates []string
 
 	addCandidate := func(title string) {
-		title = strings.TrimSpace(title)
-		if title == "" {
+		clean := CleanTitle(title)
+		if clean == "" {
 			return
 		}
-		normalized := strings.ToLower(title)
+		normalized := strings.ToLower(clean)
 		if !seen[normalized] {
 			seen[normalized] = true
-			candidates = append(candidates, title)
+			candidates = append(candidates, clean)
 		}
 	}
 
-	// 1. Official pt-BR title (clean, without year)
+	// 1. Official pt-BR title (sanitized without punctuation)
 	if officialTitle != "" {
 		addCandidate(officialTitle)
 	}
 
-	// 2. Alternative BR / PT titles (clean, without year)
+	// 2. Alternative BR / PT titles (sanitized without punctuation)
 	for _, alt := range altTitles {
 		addCandidate(alt)
 	}

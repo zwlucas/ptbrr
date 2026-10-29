@@ -345,3 +345,25 @@ func TestGetSearchCandidates(t *testing.T) {
 		}
 	}
 }
+
+func TestCleanTitle(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"Vingadores: Ultimato", "Vingadores Ultimato"},
+		{"Homem-Aranha: Sem Volta Para Casa", "Homem Aranha Sem Volta Para Casa"},
+		{"Missão: Impossível - Acerto de Contas, Parte 1", "Missão Impossível Acerto de Contas Parte 1"},
+		{"What If...?", "What If"},
+		{"Don't Look Up", "Don t Look Up"},
+		{"  Piratas  do  Vale   do  Silício!  ", "Piratas do Vale do Silício"},
+		{"O Poderoso Chefão: Parte II", "O Poderoso Chefão Parte II"},
+	}
+
+	for _, tt := range tests {
+		got := CleanTitle(tt.input)
+		if got != tt.expected {
+			t.Errorf("CleanTitle(%q) = %q, want %q", tt.input, got, tt.expected)
+		}
+	}
+}
