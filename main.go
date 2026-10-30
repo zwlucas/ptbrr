@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"runtime"
 	"syscall"
 	"time"
 
@@ -20,14 +19,6 @@ import (
 
 // version is injected at build time via -ldflags="-X main.version=vX.Y.Z".
 var version = "dev"
-
-func init() {
-	if runtime.GOOS == "windows" {
-		kernel32 := syscall.NewLazyDLL("kernel32.dll")
-		setConsoleOutputCP := kernel32.NewProc("SetConsoleOutputCP")
-		setConsoleOutputCP.Call(uintptr(65001))
-	}
-}
 
 func main() {
 	showVersion := flag.Bool("version", false, "Print version information and exit")
