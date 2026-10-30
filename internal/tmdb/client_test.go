@@ -323,7 +323,7 @@ func TestGetSearchCandidates(t *testing.T) {
 
 	client := NewClient("test-key", server.URL, 5*time.Second, 1*time.Hour)
 
-	candidates, err := client.GetSearchCandidates(context.Background(), "Pirates of Silicon Valley 1999", "")
+	candidates, err := client.GetSearchCandidates(context.Background(), "Pirates of Silicon Valley 1999", "", false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -364,6 +364,106 @@ func TestCleanTitle(t *testing.T) {
 		got := CleanTitle(tt.input)
 		if got != tt.expected {
 			t.Errorf("CleanTitle(%q) = %q, want %q", tt.input, got, tt.expected)
+		}
+	}
+}
+
+func TestIsTVRequest(t *testing.T) {
+	tests := []struct {
+		catParam string
+		tParam   string
+		query    string
+		expected bool
+	}{
+		{"2000", "search", "The Matrix", false},
+		{"2030,2040", "movie", "Inception", false},
+		{"5000", "search", "Breaking Bad", true},
+		{"5030,5040", "tvsearch", "Breaking Bad S01E01", true},
+		{"", "tvsearch", "Chernobyl", true},
+		{"", "movie", "Chernobyl", false},
+		{"", "search", "The Last of Us S01", true},
+		{"", "search", "The Last of Us Season 1", true},
+		{"", "search", "Avatar 2009", false},
+	}
+
+	for _, tt := range tests {
+		got := IsTVRequest(tt.catParam, tt.tParam, tt.query)
+		if got != tt.expected {
+			t.Errorf("IsTVRequest(%q, %q, %q) = %v, want %v", tt.catParam, tt.tParam, tt.query, got, tt.expected)
+		}
+	}
+}
+
+func TestExtractTVQueryAndSuffix(t *testing.T) {
+	tests := []struct {
+		rawQuery   string
+		wantBase   string
+		wantYear   string
+		wantSuffix string
+	}{
+		{"Breaking Bad S01E01", "Breaking Bad", "", "S01E01"},
+		{"Chernobyl S01", "Chernobyl", "", "S01"},
+		{"The Last of Us Season 1", "The Last of Us", "", "Season 1"},
+		{"Dark 2017 S01", "Dark", "2017", "S01"},
+		{"Stranger Things", "Stranger Things", "", ""},
+	}
+
+	for _, tt := range tests {
+		base, year, suffix := ExtractTVQueryAndSuffix(tt.rawQuery)
+		if base != tt.wantBase || year != tt.wantYear || suffix != tt.wantSuffix {
+			t.Errorf("ExtractTVQueryAndSuffix(%q) = (%q, %q, %q), want (%q, %q, %q)",
+				tt.rawQuery, base, year, suffix, tt.wantBase, tt.wantYear, tt.wantSuffix)
+		}
+	}
+}
+
+func TestGetTVSearchCandidates(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/search/tv":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"results": []map[string]interface{}{
+					{"id": 1396, "name": "Breaking Bad"},
+				},
+			})
+		case "/tv/1396":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":   1396,
+				"name": "Breaking Bad",
+			})
+		case "/tv/1396/alternative_titles":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id": 1396,
+				"results": []map[string]interface{}{
+					{"iso_3166_1": "PT", "title": "Ruptura Total"},
+					{"iso_3166_1": "US", "title": "Bad Breaking"},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient("test-key", server.URL, 5*time.Second, 1*time.Hour)
+
+	candidates, err := client.GetSearchCandidates(context.Background(), "Breaking Bad S01E01", "", true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expected := []string{
+		"Breaking Bad S01E01",
+		"Ruptura Total S01E01",
+	}
+
+	if len(candidates) != len(expected) {
+		t.Fatalf("expected %d candidates, got %d: %v", len(expected), len(candidates), candidates)
+	}
+	for i, exp := range expected {
+		if candidates[i] != exp {
+			t.Errorf("candidate[%d] = %q, expected %q", i, candidates[i], exp)
 		}
 	}
 }

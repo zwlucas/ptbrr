@@ -198,3 +198,98 @@ func TestEndToEndTorznabTranslationFlow(t *testing.T) {
 		t.Errorf("found unwanted English query in Prowlarr queries (fallback should be disabled): %v", prowlarrQueries)
 	}
 }
+
+func TestEndToEndSonarrTVFlow(t *testing.T) {
+	var prowlarrQueries []string
+	var queriesMu sync.Mutex
+
+	// Mock TMDB for TV
+	mockTMDB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/search/tv":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"results": []map[string]interface{}{
+					{"id": 1396, "name": "Breaking Bad"},
+				},
+			})
+		case "/tv/1396":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":   1396,
+				"name": "Breaking Bad",
+			})
+		case "/tv/1396/alternative_titles":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id": 1396,
+				"results": []map[string]interface{}{
+					{"iso_3166_1": "PT", "title": "Ruptura Total"},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer mockTMDB.Close()
+
+	// Mock Prowlarr
+	torznabXML := `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <title>Prowlarr Indexer</title>
+    <item>
+      <title>Breaking Bad S01E01 1080p</title>
+      <guid>bb-s01e01-1</guid>
+      <link>http://tracker/bb1</link>
+      <size>1500000000</size>
+    </item>
+  </channel>
+</rss>`
+
+	mockProwlarr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queriesMu.Lock()
+		prowlarrQueries = append(prowlarrQueries, r.URL.Query().Get("q"))
+		queriesMu.Unlock()
+
+		w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(torznabXML))
+	}))
+	defer mockProwlarr.Close()
+
+	prowlarrURL, _ := url.Parse(mockProwlarr.URL)
+	tmdbClient := tmdb.NewClient("my-tmdb-key", mockTMDB.URL, 5*time.Second, 1*time.Hour)
+	proxyHandler := proxy.NewProxy(prowlarrURL, tmdbClient, nil)
+
+	proxyServer := httptest.NewServer(proxyHandler)
+	defer proxyServer.Close()
+
+	// Sonarr search request with category 5030,5040 and S01E01 suffix
+	sonarrURL := fmt.Sprintf("%s/1/api?t=tvsearch&cat=5030,5040&apikey=test-key&q=Breaking%%20Bad%%20S01E01", proxyServer.URL)
+	resp, err := http.Get(sonarrURL)
+	if err != nil {
+		t.Fatalf("Sonarr request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got HTTP %d", resp.StatusCode)
+	}
+
+	queriesMu.Lock()
+	defer queriesMu.Unlock()
+
+	hasBreakingBad := false
+	hasRupturaTotal := false
+	for _, q := range prowlarrQueries {
+		if q == "Breaking Bad S01E01" {
+			hasBreakingBad = true
+		}
+		if q == "Ruptura Total S01E01" {
+			hasRupturaTotal = true
+		}
+	}
+
+	if !hasBreakingBad || !hasRupturaTotal {
+		t.Errorf("expected both 'Breaking Bad S01E01' and 'Ruptura Total S01E01' in Prowlarr fan-out queries, got %v", prowlarrQueries)
+	}
+}

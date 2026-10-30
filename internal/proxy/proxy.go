@@ -12,13 +12,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"ptbrr/internal/tmdb"
 )
 
-// TitleFetcher is an abstraction for querying localized movie titles and search candidates.
+// TitleFetcher is an abstraction for querying localized movie/TV titles and search candidates.
 type TitleFetcher interface {
 	GetMovieTitle(ctx context.Context, tmdbID string) (string, error)
 	TranslateByQuery(ctx context.Context, query string) (string, error)
-	GetSearchCandidates(ctx context.Context, rawQuery, tmdbID string) ([]string, error)
+	GetSearchCandidates(ctx context.Context, rawQuery, tmdbID string, isTV bool) ([]string, error)
 }
 
 // TorznabFeed represents the root RSS Torznab XML document.
@@ -122,9 +124,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	tmdbID := strings.TrimSpace(queryParams.Get("tmdbid"))
 	rawQ := strings.TrimSpace(queryParams.Get("q"))
 	tType := strings.TrimSpace(queryParams.Get("t"))
+	catParam := strings.TrimSpace(queryParams.Get("cat"))
 
-	// Check if this is a search request
-	isSearch := (tType == "search" || tType == "movie" || rawQ != "" || tmdbID != "") && tType != "caps"
+	// Check if this is a TV Show (Sonarr) or Movie (Radarr) request
+	isTV := tmdb.IsTVRequest(catParam, tType, rawQ)
+	isSearch := (tType == "search" || tType == "tvsearch" || tType == "movie" || rawQ != "" || tmdbID != "") && tType != "caps"
 
 	// 3. For non-search requests (e.g., t=caps), pass through transparently
 	if !isSearch || p.titleFetcher == nil {
@@ -134,10 +138,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	mode := "Movie (Radarr)"
+	if isTV {
+		mode = "TV (Sonarr)"
+	}
+	p.logger.Printf("[ROUTING] Processing %s request: q=%q cat=%q t=%q", mode, rawQ, catParam, tType)
+
 	// 4. Resolve candidate search titles from TMDB (Exclusively Portuguese titles: Official pt-BR and Alternatives)
-	candidates, err := p.titleFetcher.GetSearchCandidates(r.Context(), rawQ, tmdbID)
+	candidates, err := p.titleFetcher.GetSearchCandidates(r.Context(), rawQ, tmdbID, isTV)
 	if err != nil {
-		p.logger.Printf("[PROXY WARNING] Failed to get TMDB candidates for q=%q tmdbid=%s: %v", rawQ, tmdbID, err)
+		p.logger.Printf("[PROXY WARNING] Failed to get %s TMDB candidates for q=%q tmdbid=%s: %v", mode, rawQ, tmdbID, err)
 	}
 
 	// Rule 2: Strictly return Portuguese titles. If none found, return empty feed without querying English fallback.

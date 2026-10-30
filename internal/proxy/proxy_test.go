@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -40,7 +41,7 @@ func (m *mockTitleFetcher) TranslateByQuery(ctx context.Context, query string) (
 	return "", fmt.Errorf("query %q not found in mock", query)
 }
 
-func (m *mockTitleFetcher) GetSearchCandidates(ctx context.Context, rawQuery, tmdbID string) ([]string, error) {
+func (m *mockTitleFetcher) GetSearchCandidates(ctx context.Context, rawQuery, tmdbID string, isTV bool) ([]string, error) {
 	if m.err != nil {
 		return nil, m.err
 	}
@@ -361,5 +362,52 @@ func TestProxy_FanOutAndMergeDeduplication(t *testing.T) {
 	}
 	if !guids["guid-1"] || !guids["guid-2"] {
 		t.Errorf("missing expected guids in merged feed: %v", guids)
+	}
+}
+
+func TestProxy_SonarrTVSearchFanOut(t *testing.T) {
+	var requestedQueries []string
+	var mu sync.Mutex
+
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requestedQueries = append(requestedQueries, r.URL.Query().Get("q"))
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/xml")
+		fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?><rss version="2.0"><channel><title>Prowlarr</title><item><title>%s 720p</title><guid>%s</guid></item></channel></rss>`, r.URL.Query().Get("q"), r.URL.Query().Get("q"))
+	}))
+	defer upstreamServer.Close()
+
+	upstreamURL, _ := url.Parse(upstreamServer.URL)
+	fetcher := &mockTitleFetcher{
+		candidates: map[string][]string{
+			"Breaking Bad S01E01": {
+				"Breaking Bad S01E01",
+				"Ruptura Total S01E01",
+			},
+		},
+	}
+
+	proxyHandler := NewProxy(upstreamURL, fetcher, nil)
+	proxyServer := httptest.NewServer(proxyHandler)
+	defer proxyServer.Close()
+
+	// Simulate Sonarr query with category 5030,5040 (TV)
+	reqURL := fmt.Sprintf("%s/1/api?t=tvsearch&cat=5030,5040&q=Breaking%%20Bad%%20S01E01", proxyServer.URL)
+	resp, err := http.Get(reqURL)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requestedQueries) != 2 {
+		t.Errorf("expected 2 fan-out queries for TV show, got %d: %v", len(requestedQueries), requestedQueries)
 	}
 }

@@ -42,6 +42,59 @@ func CleanTitle(title string) string {
 	return strings.TrimSpace(cleaned)
 }
 
+// tvSuffixRegex captures season/episode patterns at the end of TV queries (e.g., "S01E01", "S01", "Season 1", "Temporada 2").
+var tvSuffixRegex = regexp.MustCompile(`(?i)\s+((?:S\d{1,4}(?:E\d{1,4}(?:-E\d{1,4})?)?|(?:Season|Temporada)\s+\d{1,2}))\s*$`)
+
+// IsTVRequest inspects Torznab category (cat), query type (t), and rawQuery.
+// Categories in the 5000s (e.g. 5000, 5030, 5040) are Sonarr / TV Shows.
+// Categories in the 2000s (e.g. 2000, 2030, 2040) are Radarr / Movies.
+func IsTVRequest(catParam, tParam, rawQuery string) bool {
+	if tParam == "tvsearch" {
+		return true
+	}
+	if tParam == "movie" {
+		return false
+	}
+
+	for _, part := range strings.Split(catParam, ",") {
+		part = strings.TrimSpace(part)
+		if len(part) >= 4 {
+			if strings.HasPrefix(part, "5") {
+				return true
+			}
+			if strings.HasPrefix(part, "2") {
+				return false
+			}
+		}
+	}
+
+	// Fallback detection: if query contains TV season/episode patterns (e.g. S01E01, Season 1)
+	_, _, suffix := ExtractTVQueryAndSuffix(rawQuery)
+	return suffix != ""
+}
+
+// ExtractTVQueryAndSuffix extracts the base series name, optional year, and season/episode suffix.
+// Examples:
+// "Breaking Bad S01E01" -> ("Breaking Bad", "", "S01E01")
+// "Chernobyl S01" -> ("Chernobyl", "", "S01")
+// "The Last of Us Season 1" -> ("The Last of Us", "", "Season 1")
+// "Dark 2017 S01" -> ("Dark", "2017", "S01")
+func ExtractTVQueryAndSuffix(rawQuery string) (baseName, year, suffix string) {
+	trimmed := strings.TrimSpace(rawQuery)
+	matches := tvSuffixRegex.FindStringSubmatch(trimmed)
+	basePart := trimmed
+	if len(matches) == 2 {
+		suffix = strings.TrimSpace(matches[1])
+		basePart = strings.TrimSpace(tvSuffixRegex.ReplaceAllString(trimmed, ""))
+	}
+
+	cleanBase, yr := extractYearAndCleanTitle(basePart)
+	if cleanBase == "" {
+		cleanBase = basePart
+	}
+	return cleanBase, yr, suffix
+}
+
 type cacheEntry struct {
 	title     string
 	expiresAt time.Time
@@ -117,6 +170,236 @@ type alternativeTitlesResponse struct {
 	} `json:"titles"`
 }
 
+// searchTVResponse matches TMDB /search/tv JSON response.
+type searchTVResponse struct {
+	Page    int `json:"page"`
+	Results []struct {
+		ID           int64  `json:"id"`
+		Name         string `json:"name"`
+		OriginalName string `json:"original_name"`
+	} `json:"results"`
+	TotalResults int `json:"total_results"`
+}
+
+// tvDetailsResponse matches TMDB /tv/{id} JSON response.
+type tvDetailsResponse struct {
+	ID           int64  `json:"id"`
+	Name         string `json:"name"`
+	OriginalName string `json:"original_name"`
+}
+
+// tvAlternativeTitlesResponse matches TMDB /tv/{id}/alternative_titles JSON response.
+type tvAlternativeTitlesResponse struct {
+	ID      int64 `json:"id"`
+	Results []struct {
+		ISO3166_1 string `json:"iso_3166_1"`
+		Title     string `json:"title"`
+	} `json:"results"`
+}
+
+// GetTVShowTitle fetches the localized pt-BR name for a given TV show ID.
+func (c *Client) GetTVShowTitle(ctx context.Context, tvID string) (string, error) {
+	tvID = strings.TrimSpace(tvID)
+	if tvID == "" {
+		return "", ErrEmptyTMDBID
+	}
+	if title, found := c.getFromCache("tv:" + tvID); found {
+		return title, nil
+	}
+	if c.apiKey == "" {
+		return "", ErrMissingAPIKey
+	}
+
+	endpoint := fmt.Sprintf("%s/tv/%s?api_key=%s&language=pt-BR",
+		c.baseURL,
+		url.PathEscape(tvID),
+		url.QueryEscape(c.apiKey),
+	)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "ptbrr-proxy/1.0")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("TMDB TV returned HTTP %d", resp.StatusCode)
+	}
+
+	var tv tvDetailsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tv); err != nil {
+		return "", err
+	}
+
+	name := strings.TrimSpace(tv.Name)
+	if name == "" {
+		return "", ErrTitleNotFound
+	}
+
+	c.setInCache("tv:"+tvID, name)
+	return name, nil
+}
+
+// GetTVAlternativeTitles fetches alternative titles for a TV show ID, filtering for BR and PT.
+func (c *Client) GetTVAlternativeTitles(ctx context.Context, tvID string) ([]string, error) {
+	tvID = strings.TrimSpace(tvID)
+	if tvID == "" {
+		return nil, ErrEmptyTMDBID
+	}
+	if c.apiKey == "" {
+		return nil, ErrMissingAPIKey
+	}
+
+	endpoint := fmt.Sprintf("%s/tv/%s/alternative_titles?api_key=%s",
+		c.baseURL,
+		url.PathEscape(tvID),
+		url.QueryEscape(c.apiKey),
+	)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "ptbrr-proxy/1.0")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("TMDB TV alternative_titles returned HTTP %d", resp.StatusCode)
+	}
+
+	var altResp tvAlternativeTitlesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&altResp); err != nil {
+		return nil, err
+	}
+
+	var titles []string
+	for _, t := range altResp.Results {
+		iso := strings.ToUpper(strings.TrimSpace(t.ISO3166_1))
+		cleanT := strings.TrimSpace(t.Title)
+		if (iso == "BR" || iso == "PT") && cleanT != "" {
+			titles = append(titles, cleanT)
+		}
+	}
+	return titles, nil
+}
+
+// GetTVSearchCandidates searches TMDB TV, fetches pt-BR & alternative titles, sanitizes with CleanTitle,
+// and re-attaches the exact season/episode suffix (e.g. "S01E01").
+func (c *Client) GetTVSearchCandidates(ctx context.Context, rawQuery, tmdbID string) ([]string, error) {
+	rawQuery = strings.TrimSpace(rawQuery)
+	tmdbID = strings.TrimSpace(tmdbID)
+	baseName, year, suffix := ExtractTVQueryAndSuffix(rawQuery)
+
+	tvID := tmdbID
+	if tvID == "" && baseName != "" {
+		searchURL := fmt.Sprintf("%s/search/tv?api_key=%s&query=%s",
+			c.baseURL,
+			url.QueryEscape(c.apiKey),
+			url.QueryEscape(baseName),
+		)
+		if year != "" {
+			searchURL += fmt.Sprintf("&first_air_date_year=%s", url.QueryEscape(year))
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, searchURL, nil)
+		if err == nil {
+			req.Header.Set("Accept", "application/json")
+			req.Header.Set("User-Agent", "ptbrr-proxy/1.0")
+			if resp, err := c.httpClient.Do(req); err == nil {
+				defer resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					var sResp searchTVResponse
+					if err := json.NewDecoder(resp.Body).Decode(&sResp); err == nil && len(sResp.Results) > 0 {
+						tvID = strconv.FormatInt(sResp.Results[0].ID, 10)
+					}
+				}
+			}
+		}
+	}
+
+	if tvID == "" {
+		return nil, errors.New("could not identify TV show from query")
+	}
+
+	// Cache check
+	cacheKey := fmt.Sprintf("tvcands:%s:%s", tvID, suffix)
+	c.mu.RLock()
+	entry, found := c.candidatesCache[cacheKey]
+	c.mu.RUnlock()
+	if found && time.Now().Before(entry.expiresAt) {
+		return entry.titles, nil
+	}
+
+	// Concurrently fetch official pt-BR title and alternative titles
+	var officialTitle string
+	var altTitles []string
+	var wg sync.WaitGroup
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if t, err := c.GetTVShowTitle(ctx, tvID); err == nil && t != "" {
+			officialTitle = t
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		if alts, err := c.GetTVAlternativeTitles(ctx, tvID); err == nil {
+			altTitles = alts
+		}
+	}()
+
+	wg.Wait()
+
+	seen := make(map[string]bool)
+	var candidates []string
+
+	addCandidate := func(title string) {
+		clean := CleanTitle(title)
+		if clean == "" {
+			return
+		}
+		if suffix != "" {
+			clean = fmt.Sprintf("%s %s", clean, suffix)
+		}
+		normalized := strings.ToLower(clean)
+		if !seen[normalized] {
+			seen[normalized] = true
+			candidates = append(candidates, clean)
+		}
+	}
+
+	if officialTitle != "" {
+		addCandidate(officialTitle)
+	}
+	for _, alt := range altTitles {
+		addCandidate(alt)
+	}
+
+	c.mu.Lock()
+	c.candidatesCache[cacheKey] = candidatesCacheEntry{
+		titles:    candidates,
+		expiresAt: time.Now().Add(c.cacheTTL),
+	}
+	c.mu.Unlock()
+
+	return candidates, nil
+}
+
 // GetAlternativeTitles fetches Portuguese alternative titles (iso_3166_1: "BR" or "PT") for a given movie ID.
 func (c *Client) GetAlternativeTitles(ctx context.Context, movieID string) ([]string, error) {
 	movieID = strings.TrimSpace(movieID)
@@ -167,12 +450,18 @@ func (c *Client) GetAlternativeTitles(ctx context.Context, movieID string) ([]st
 	return titles, nil
 }
 
-// GetSearchCandidates resolves the movie ID and fetches:
+// GetSearchCandidates routes the request to TV or Movie candidate resolver based on isTV.
+func (c *Client) GetSearchCandidates(ctx context.Context, rawQuery, tmdbID string, isTV bool) ([]string, error) {
+	if isTV {
+		return c.GetTVSearchCandidates(ctx, rawQuery, tmdbID)
+	}
+	return c.GetMovieSearchCandidates(ctx, rawQuery, tmdbID)
+}
+
+// GetMovieSearchCandidates resolves the movie ID and fetches:
 // 1. The official localized pt-BR title
 // 2. Alternative titles for BR and PT
-// 3. The original search query
-// It attaches the original release year (if found) to each title and returns a deduplicated slice.
-func (c *Client) GetSearchCandidates(ctx context.Context, rawQuery, tmdbID string) ([]string, error) {
+func (c *Client) GetMovieSearchCandidates(ctx context.Context, rawQuery, tmdbID string) ([]string, error) {
 	rawQuery = strings.TrimSpace(rawQuery)
 	tmdbID = strings.TrimSpace(tmdbID)
 	cleanTitle, year := extractYearAndCleanTitle(rawQuery)
