@@ -112,7 +112,8 @@ O **ptbrr** escuta na porta `9697` e atende **simultaneamente** tanto o Radarr q
 ### 1. Criar Usuário do Sistema e Diretórios
 No terminal do container LXC (Debian ou Ubuntu):
 ```bash
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin ptbrr
+# Cria o grupo e o usuário de sistema dedicados 'ptbrr'
+sudo adduser --system --group --no-create-home ptbrr 2>/dev/null || sudo useradd -r -U -s /usr/sbin/nologin ptbrr
 sudo mkdir -p /etc/ptbrr
 ```
 
