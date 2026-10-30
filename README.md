@@ -143,6 +143,9 @@ Verifique a versão:
 ### 3. Configurar Arquivo de Ambiente
 Crie `/etc/ptbrr/ptbrr.env`:
 ```bash
+sudo mkdir -p /etc/ptbrr
+```
+```bash
 sudo nano /etc/ptbrr/ptbrr.env
 ```
 Conteúdo:
