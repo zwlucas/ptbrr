@@ -188,6 +188,16 @@ type tvDetailsResponse struct {
 	OriginalName string `json:"original_name"`
 }
 
+// findResultsResponse matches TMDB /find/{external_id} JSON response.
+type findResultsResponse struct {
+	MovieResults []struct {
+		ID int64 `json:"id"`
+	} `json:"movie_results"`
+	TVResults []struct {
+		ID int64 `json:"id"`
+	} `json:"tv_results"`
+}
+
 // tvAlternativeTitlesResponse matches TMDB /tv/{id}/alternative_titles JSON response.
 type tvAlternativeTitlesResponse struct {
 	ID      int64 `json:"id"`
@@ -294,6 +304,75 @@ func (c *Client) GetTVAlternativeTitles(ctx context.Context, tvID string) ([]str
 		}
 	}
 	return titles, nil
+}
+
+// FindTMDBIDByExternalID queries TMDB /find/{external_id}?external_source={source}.
+// Supported sources: "tvdb_id", "imdb_id".
+func (c *Client) FindTMDBIDByExternalID(ctx context.Context, externalID, source string, isTV bool) (string, error) {
+	externalID = strings.TrimSpace(externalID)
+	if externalID == "" {
+		return "", errors.New("empty external id")
+	}
+	if c.apiKey == "" {
+		return "", ErrMissingAPIKey
+	}
+
+	cacheKey := fmt.Sprintf("extid:%s:%s", source, externalID)
+	if id, found := c.getFromCache(cacheKey); found {
+		return id, nil
+	}
+
+	endpoint := fmt.Sprintf("%s/find/%s?api_key=%s&external_source=%s",
+		c.baseURL,
+		url.PathEscape(externalID),
+		url.QueryEscape(c.apiKey),
+		url.QueryEscape(source),
+	)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "ptbrr-proxy/1.0")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("TMDB /find returned HTTP %d", resp.StatusCode)
+	}
+
+	var res findResultsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return "", err
+	}
+
+	var foundID int64
+	if isTV {
+		if len(res.TVResults) > 0 {
+			foundID = res.TVResults[0].ID
+		} else if len(res.MovieResults) > 0 {
+			foundID = res.MovieResults[0].ID
+		}
+	} else {
+		if len(res.MovieResults) > 0 {
+			foundID = res.MovieResults[0].ID
+		} else if len(res.TVResults) > 0 {
+			foundID = res.TVResults[0].ID
+		}
+	}
+
+	if foundID == 0 {
+		return "", ErrTitleNotFound
+	}
+
+	idStr := strconv.FormatInt(foundID, 10)
+	c.setInCache(cacheKey, idStr)
+	return idStr, nil
 }
 
 // GetTVSearchCandidates searches TMDB TV, fetches pt-BR & alternative titles, sanitizes with CleanTitle,

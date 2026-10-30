@@ -293,3 +293,74 @@ func TestEndToEndSonarrTVFlow(t *testing.T) {
 		t.Errorf("expected both 'Breaking Bad S01E01' and 'Ruptura Total S01E01' in Prowlarr fan-out queries, got %v", prowlarrQueries)
 	}
 }
+
+func TestEndToEndBypassEmptyQueryRSSSync(t *testing.T) {
+	var tmdbCallCount int32
+	var prowlarrCallCount int32
+
+	// Mock TMDB should never be contacted during RSS sync or connection tests
+	mockTMDB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&tmdbCallCount, 1)
+		http.Error(w, "TMDB must not be called", http.StatusInternalServerError)
+	}))
+	defer mockTMDB.Close()
+
+	rssXML := `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Prowlarr RSS Feed</title>
+    <item>
+      <title>Latest.Release.S01E01.1080p</title>
+      <guid>rss-item-1</guid>
+    </item>
+  </channel>
+</rss>`
+
+	mockProwlarr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&prowlarrCallCount, 1)
+		w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(rssXML))
+	}))
+	defer mockProwlarr.Close()
+
+	prowlarrURL, _ := url.Parse(mockProwlarr.URL)
+	tmdbClient := tmdb.NewClient("my-tmdb-key", mockTMDB.URL, 5*time.Second, 1*time.Hour)
+	proxyHandler := proxy.NewProxy(prowlarrURL, tmdbClient, nil)
+
+	proxyServer := httptest.NewServer(proxyHandler)
+	defer proxyServer.Close()
+
+	// 1. Sonarr TV RSS Sync (no q param, empty q)
+	sonarrRSSURL := fmt.Sprintf("%s/1/api?t=tvsearch&cat=5030,5040&apikey=test-key", proxyServer.URL)
+	resp1, err := http.Get(sonarrRSSURL)
+	if err != nil {
+		t.Fatalf("Sonarr RSS sync failed: %v", err)
+	}
+	defer resp1.Body.Close()
+	body1, _ := io.ReadAll(resp1.Body)
+	if !strings.Contains(string(body1), "Latest.Release.S01E01.1080p") {
+		t.Errorf("expected Prowlarr RSS feed, got %s", string(body1))
+	}
+
+	// 2. Radarr Movie RSS Sync (no q param)
+	radarrRSSURL := fmt.Sprintf("%s/1/api?t=movie&cat=2000&apikey=test-key&q=", proxyServer.URL)
+	resp2, err := http.Get(radarrRSSURL)
+	if err != nil {
+		t.Fatalf("Radarr RSS sync failed: %v", err)
+	}
+	defer resp2.Body.Close()
+	body2, _ := io.ReadAll(resp2.Body)
+	if !strings.Contains(string(body2), "Latest.Release.S01E01.1080p") {
+		t.Errorf("expected Prowlarr RSS feed, got %s", string(body2))
+	}
+
+	// Verify TMDB was never called
+	if tmdbCount := atomic.LoadInt32(&tmdbCallCount); tmdbCount != 0 {
+		t.Errorf("expected 0 TMDB calls during RSS sync bypass, got %d", tmdbCount)
+	}
+	// Verify Prowlarr received both bypassed requests
+	if prowlarrCount := atomic.LoadInt32(&prowlarrCallCount); prowlarrCount != 2 {
+		t.Errorf("expected 2 Prowlarr calls for RSS sync bypass, got %d", prowlarrCount)
+	}
+}

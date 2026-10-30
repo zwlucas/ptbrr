@@ -23,6 +23,11 @@ type TitleFetcher interface {
 	GetSearchCandidates(ctx context.Context, rawQuery, tmdbID string, isTV bool) ([]string, error)
 }
 
+// ExternalIDResolver can be implemented by TitleFetcher to resolve external IDs (e.g. TVDB, IMDB) to TMDB IDs.
+type ExternalIDResolver interface {
+	FindTMDBIDByExternalID(ctx context.Context, externalID, source string, isTV bool) (string, error)
+}
+
 // TorznabFeed represents the root RSS Torznab XML document.
 type TorznabFeed struct {
 	XMLName      xml.Name       `xml:"rss"`
@@ -122,16 +127,55 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 2. Parse query parameters
 	queryParams := r.URL.Query()
 	tmdbID := strings.TrimSpace(queryParams.Get("tmdbid"))
+	tvdbID := strings.TrimSpace(queryParams.Get("tvdbid"))
+	imdbID := strings.TrimSpace(queryParams.Get("imdbid"))
 	rawQ := strings.TrimSpace(queryParams.Get("q"))
 	tType := strings.TrimSpace(queryParams.Get("t"))
 	catParam := strings.TrimSpace(queryParams.Get("cat"))
 
+	// 3. Bypass (Passthrough) Rule:
+	// If 'q' is empty and no search ID (tmdbid, tvdbid, imdbid) is present,
+	// this is an RSS sync feed fetch or connection test.
+	// Bypass TMDB calls and Fan-Out completely, forwarding directly to upstream Prowlarr.
+	hasSearchID := tmdbID != "" || tvdbID != "" || imdbID != ""
+	if rawQ == "" && !hasSearchID {
+		p.logger.Printf("[BYPASS] Empty query/RSS sync detected. Forwarding directly to Upstream.")
+		recorder := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+		p.reverseProxy.ServeHTTP(recorder, r)
+		p.logger.Printf("[PROXY PASSTHROUGH] %s %s -> status=%d duration=%v", r.Method, r.URL.RequestURI(), recorder.statusCode, time.Since(start))
+		return
+	}
+
 	// Check if this is a TV Show (Sonarr) or Movie (Radarr) request
 	isTV := tmdb.IsTVRequest(catParam, tType, rawQ)
-	isSearch := (tType == "search" || tType == "tvsearch" || tType == "movie" || rawQ != "" || tmdbID != "") && tType != "caps"
+	isSearch := (tType == "search" || tType == "tvsearch" || tType == "movie" || rawQ != "" || hasSearchID) && tType != "caps"
 
-	// 3. For non-search requests (e.g., t=caps), pass through transparently
+	// 4. For non-search requests (e.g., t=caps), pass through transparently
 	if !isSearch || p.titleFetcher == nil {
+		recorder := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+		p.reverseProxy.ServeHTTP(recorder, r)
+		p.logger.Printf("[PROXY PASSTHROUGH] %s %s -> status=%d duration=%v", r.Method, r.URL.RequestURI(), recorder.statusCode, time.Since(start))
+		return
+	}
+
+	// If tmdbid is missing but tvdbid or imdbid is provided, attempt resolution via external ID
+	if tmdbID == "" && (tvdbID != "" || imdbID != "") {
+		if resolver, ok := p.titleFetcher.(ExternalIDResolver); ok {
+			if tvdbID != "" {
+				if resolved, err := resolver.FindTMDBIDByExternalID(r.Context(), tvdbID, "tvdb_id", isTV); err == nil && resolved != "" {
+					tmdbID = resolved
+				}
+			} else if imdbID != "" {
+				if resolved, err := resolver.FindTMDBIDByExternalID(r.Context(), imdbID, "imdb_id", isTV); err == nil && resolved != "" {
+					tmdbID = resolved
+				}
+			}
+		}
+	}
+
+	// If rawQ is empty and tmdbID could not be determined, forward original request directly to Upstream
+	if rawQ == "" && tmdbID == "" {
+		p.logger.Printf("[BYPASS] No TMDB ID or query text available for translation. Forwarding directly to Upstream.")
 		recorder := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
 		p.reverseProxy.ServeHTTP(recorder, r)
 		p.logger.Printf("[PROXY PASSTHROUGH] %s %s -> status=%d duration=%v", r.Method, r.URL.RequestURI(), recorder.statusCode, time.Since(start))

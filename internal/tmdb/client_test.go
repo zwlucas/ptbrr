@@ -467,3 +467,51 @@ func TestGetTVSearchCandidates(t *testing.T) {
 		}
 	}
 }
+
+func TestFindTMDBIDByExternalID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/find/81189":
+			if r.URL.Query().Get("external_source") == "tvdb_id" {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"tv_results": []map[string]interface{}{
+						{"id": 1396},
+					},
+				})
+				return
+			}
+		case "/find/tt0133093":
+			if r.URL.Query().Get("external_source") == "imdb_id" {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"movie_results": []map[string]interface{}{
+						{"id": 603},
+					},
+				})
+				return
+			}
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	client := NewClient("test-key", server.URL, 5*time.Second, 1*time.Hour)
+
+	// Test TVDB ID resolution for TV
+	tvID, err := client.FindTMDBIDByExternalID(context.Background(), "81189", "tvdb_id", true)
+	if err != nil {
+		t.Fatalf("unexpected error finding TVDB ID: %v", err)
+	}
+	if tvID != "1396" {
+		t.Errorf("expected TMDB ID '1396', got %q", tvID)
+	}
+
+	// Test IMDB ID resolution for Movie
+	movieID, err := client.FindTMDBIDByExternalID(context.Background(), "tt0133093", "imdb_id", false)
+	if err != nil {
+		t.Fatalf("unexpected error finding IMDB ID: %v", err)
+	}
+	if movieID != "603" {
+		t.Errorf("expected TMDB ID '603', got %q", movieID)
+	}
+}

@@ -411,3 +411,69 @@ func TestProxy_SonarrTVSearchFanOut(t *testing.T) {
 		t.Errorf("expected 2 fan-out queries for TV show, got %d: %v", len(requestedQueries), requestedQueries)
 	}
 }
+
+func TestProxy_BypassEmptyQueryRSSSync(t *testing.T) {
+	var upstreamCalled bool
+
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?><rss version="2.0"><channel><title>Prowlarr RSS</title><item><title>Latest.Release.1080p</title></item></channel></rss>`))
+	}))
+	defer upstreamServer.Close()
+
+	upstreamURL, _ := url.Parse(upstreamServer.URL)
+	// Fetcher will return error if called, verifying that TMDB is bypassed
+	fetcher := &mockTitleFetcher{
+		err: errors.New("TMDB should NOT be called on empty query RSS sync"),
+	}
+
+	proxyHandler := NewProxy(upstreamURL, fetcher, nil)
+	proxyServer := httptest.NewServer(proxyHandler)
+	defer proxyServer.Close()
+
+	testCases := []struct {
+		name string
+		url  string
+	}{
+		{
+			name: "Sonarr RSS Sync (t=tvsearch with empty q)",
+			url:  fmt.Sprintf("%s/1/api?t=tvsearch&cat=5030,5040&q=&apikey=my-key", proxyServer.URL),
+		},
+		{
+			name: "Sonarr RSS Sync (t=tvsearch without q param)",
+			url:  fmt.Sprintf("%s/1/api?t=tvsearch&cat=5030,5040&apikey=my-key", proxyServer.URL),
+		},
+		{
+			name: "Radarr RSS Sync (t=movie without q param)",
+			url:  fmt.Sprintf("%s/1/api?t=movie&cat=2000&apikey=my-key", proxyServer.URL),
+		},
+		{
+			name: "General RSS Sync (t=search with q whitespace)",
+			url:  fmt.Sprintf("%s/1/api?t=search&cat=2000&q=%%20%%20&apikey=my-key", proxyServer.URL),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstreamCalled = false
+			resp, err := http.Get(tc.url)
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("expected 200 OK, got HTTP %d", resp.StatusCode)
+			}
+			if !upstreamCalled {
+				t.Errorf("expected request to be forwarded directly to Upstream Prowlarr")
+			}
+
+			body, _ := io.ReadAll(resp.Body)
+			if !strings.Contains(string(body), "Latest.Release.1080p") {
+				t.Errorf("expected Upstream RSS feed content, got %s", string(body))
+			}
+		})
+	}
+}
